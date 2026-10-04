@@ -46,6 +46,7 @@ class StaticInvariantAuditor:
     def __init__(self, root_dir: Optional[Path] = None):
         self.root_dir = root_dir or Path(__file__).parent.parent
         self.coder_path = self.root_dir / "agents" / "coder.py"
+        self.auditor_path = self.root_dir / "agents" / "auditor.py"
         self.bus_path = self.root_dir / "bus.py"
 
     def audit_coder_max_risk(self) -> AuditResult:
@@ -193,11 +194,144 @@ class StaticInvariantAuditor:
                 message=f"File read error: {e}",
             )
 
+    def audit_auditor_daily_loss_limit(self) -> AuditResult:
+        """
+        Verifies that agents/auditor.py enforces a hard daily loss limit
+        rejecting trade entries when daily PnL <= -1500.0 INR.
+        """
+        if not self.auditor_path.exists():
+            return AuditResult(
+                name="auditor.py: Hard daily loss limit (<= -1500 INR)",
+                passed=False,
+                message=f"File not found: {self.auditor_path}",
+            )
+
+        try:
+            content = self.auditor_path.read_text(encoding="utf-8")
+            tree = ast.parse(content)
+
+            loss_val = None
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == "MAX_DAILY_LOSS_INR":
+                            loss_val = ast.literal_eval(node.value)
+                            break
+                elif isinstance(node, ast.AnnAssign):
+                    if isinstance(node.target, ast.Name) and node.target.id == "MAX_DAILY_LOSS_INR" and node.value:
+                        loss_val = ast.literal_eval(node.value)
+                        break
+
+            if loss_val is None:
+                return AuditResult(
+                    name="auditor.py: Hard daily loss limit (<= -1500 INR)",
+                    passed=False,
+                    message="Constant MAX_DAILY_LOSS_INR not found in agents/auditor.py",
+                )
+
+            # Invariant check: Loss limit cannot be worse than -1500 INR (e.g. -2000 is breach)
+            if not (isinstance(loss_val, (int, float)) and loss_val >= -1500.0 and loss_val <= 0.0):
+                return AuditResult(
+                    name="auditor.py: Hard daily loss limit (<= -1500 INR)",
+                    passed=False,
+                    message=f"Configured limit {loss_val} INR breaches hard invariant of -1500.0 INR",
+                )
+
+            # Check that an invariant condition checks total_pnl <= MAX_DAILY_LOSS_INR or <= -1500
+            has_check = bool(
+                re.search(r'total_pnl\s*<=\s*(MAX_DAILY_LOSS_INR|-1500)', content)
+            )
+            if not has_check:
+                return AuditResult(
+                    name="auditor.py: Hard daily loss limit (<= -1500 INR)",
+                    passed=False,
+                    message="Invariant check for total_pnl <= MAX_DAILY_LOSS_INR not implemented in audit flow",
+                )
+
+            return AuditResult(
+                name="auditor.py: Hard daily loss limit (<= -1500 INR)",
+                passed=True,
+                message=f"Enforces rejection when daily PnL <= {loss_val} INR (Kill-Switch Active)",
+            )
+        except Exception as e:
+            return AuditResult(
+                name="auditor.py: Hard daily loss limit (<= -1500 INR)",
+                passed=False,
+                message=f"Audit inspection error: {e}",
+            )
+
+    def audit_auditor_max_daily_trades(self) -> AuditResult:
+        """
+        Verifies that agents/auditor.py enforces a maximum daily trade count
+        rejecting trade entries when daily trade count >= 2.
+        """
+        if not self.auditor_path.exists():
+            return AuditResult(
+                name="auditor.py: Maximum daily trades limit (<= 2)",
+                passed=False,
+                message=f"File not found: {self.auditor_path}",
+            )
+
+        try:
+            content = self.auditor_path.read_text(encoding="utf-8")
+            tree = ast.parse(content)
+
+            trades_val = None
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == "MAX_DAILY_TRADES":
+                            trades_val = ast.literal_eval(node.value)
+                            break
+                elif isinstance(node, ast.AnnAssign):
+                    if isinstance(node.target, ast.Name) and node.target.id == "MAX_DAILY_TRADES" and node.value:
+                        trades_val = ast.literal_eval(node.value)
+                        break
+
+            if trades_val is None:
+                return AuditResult(
+                    name="auditor.py: Maximum daily trades limit (<= 2)",
+                    passed=False,
+                    message="Constant MAX_DAILY_TRADES not found in agents/auditor.py",
+                )
+
+            if not (isinstance(trades_val, int) and 1 <= trades_val <= 2):
+                return AuditResult(
+                    name="auditor.py: Maximum daily trades limit (<= 2)",
+                    passed=False,
+                    message=f"Configured limit {trades_val} trades exceeds hard cap of 2 trades/day",
+                )
+
+            # Check that an invariant condition checks trade_count >= MAX_DAILY_TRADES or >= 2
+            has_check = bool(
+                re.search(r'trade_count\s*>=\s*(MAX_DAILY_TRADES|2)', content)
+            )
+            if not has_check:
+                return AuditResult(
+                    name="auditor.py: Maximum daily trades limit (<= 2)",
+                    passed=False,
+                    message="Invariant check for trade_count >= MAX_DAILY_TRADES not implemented in audit flow",
+                )
+
+            return AuditResult(
+                name="auditor.py: Maximum daily trades limit (<= 2)",
+                passed=True,
+                message=f"Enforces rejection when daily trade count >= {trades_val} (Daily Cap Guarded)",
+            )
+        except Exception as e:
+            return AuditResult(
+                name="auditor.py: Maximum daily trades limit (<= 2)",
+                passed=False,
+                message=f"Audit inspection error: {e}",
+            )
+
     def run_full_audit(self) -> list[AuditResult]:
         """Runs all static invariant checks and returns results."""
         return [
             self.audit_coder_max_risk(),
             self.audit_coder_leg_ordering(),
+            self.audit_auditor_daily_loss_limit(),
+            self.audit_auditor_max_daily_trades(),
             self.audit_bus_wal_mode(),
         ]
 
@@ -211,19 +345,19 @@ class StaticInvariantAuditor:
         failed_count = total - passed_count
         all_passed = (failed_count == 0)
 
-        print("\n" + "=" * 70)
-        print("           OVERSEER AGENT: STATIC INVARIANT AUDIT SCORECARD")
-        print("=" * 70)
+        print("\n" + "=" * 80)
+        print("             OVERSEER AGENT: STATIC INVARIANT AUDIT SCORECARD")
+        print("=" * 80)
 
         for r in results:
             tag = "[PASS]" if r.passed else "[FAIL]"
-            print(f" {tag:<7} | {r.name:<38} | {r.message}")
+            print(f" {tag:<7} | {r.name:<48} | {r.message}")
 
-        print("=" * 70)
+        print("=" * 80)
         print(f" TOTAL INVARIANTS: {total} | PASSED: {passed_count} | FAILED: {failed_count}")
         status_line = "ALL INVARIANTS SATISFIED [PASS]" if all_passed else "INVARIANT VIOLATIONS DETECTED [FAIL]"
         print(f" STATUS: {status_line}")
-        print("=" * 70 + "\n")
+        print("=" * 80 + "\n")
 
         return all_passed
 

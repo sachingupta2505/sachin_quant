@@ -25,6 +25,8 @@ from audit_logger import AuditLogger
 from risk_guard import RiskGuard, RiskState
 
 IST = ZoneInfo("Asia/Kolkata")
+MAX_DAILY_LOSS_INR: float = -1500.0  # Hard daily loss kill-switch in INR
+MAX_DAILY_TRADES: int = 2            # Hard limit: maximum 2 trades per day
 
 
 class AuditorAgent(BaseAgent):
@@ -70,7 +72,39 @@ class AuditorAgent(BaseAgent):
                 self.dispatch_fn(veto_msg)
             return
 
-        # 2. Evaluate hard FSM limits
+        # 2. Hard daily loss limit invariant check (rejects if daily PnL <= -1500.0 INR)
+        if self.risk_guard.total_pnl <= MAX_DAILY_LOSS_INR:
+            reason = f"Hard daily loss limit breached: total PnL ₹{self.risk_guard.total_pnl:.2f} <= ₹{MAX_DAILY_LOSS_INR:.2f}"
+            self.logger.warning(f"[AUDIT VETO] Order {trade_id} REJECTED! Reason: {reason}")
+            if self.dispatch_fn:
+                veto_msg = AgentMessage(
+                    msg_id=f"REJ-{uuid.uuid4().hex[:6].upper()}",
+                    sender=self.name,
+                    recipient="Coder",
+                    msg_type=MessageType.AUDIT_REJECTED,
+                    payload={"trade_id": trade_id, "reason": reason, "timestamp": ts},
+                    timestamp=ts,
+                )
+                self.dispatch_fn(veto_msg)
+            return
+
+        # 3. Maximum daily trades check (rejects if daily trade count >= 2)
+        if self.risk_guard.trade_count >= MAX_DAILY_TRADES:
+            reason = f"Maximum daily trade limit ({MAX_DAILY_TRADES}) reached: {self.risk_guard.trade_count} trades"
+            self.logger.warning(f"[AUDIT VETO] Order {trade_id} REJECTED! Reason: {reason}")
+            if self.dispatch_fn:
+                veto_msg = AgentMessage(
+                    msg_id=f"REJ-{uuid.uuid4().hex[:6].upper()}",
+                    sender=self.name,
+                    recipient="Coder",
+                    msg_type=MessageType.AUDIT_REJECTED,
+                    payload={"trade_id": trade_id, "reason": reason, "timestamp": ts},
+                    timestamp=ts,
+                )
+                self.dispatch_fn(veto_msg)
+            return
+
+        # 4. Evaluate full FSM limits (timing gates, session state)
         allowed, reason = self.risk_guard.can_enter_trade(current_time=ts)
 
         if not allowed:
