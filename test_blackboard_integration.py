@@ -82,9 +82,10 @@ def test_blackboard_end_to_end_flow(clean_blackboard):
         },
     )
     assert order_id > 0
+    bus.update_status(sig.id, EventStatus.COMPLETED)
 
     # STEP 3: Auditor consumes ORDER_PROPOSED, evaluates FSM, publishes ORDER_APPROVED
-    orders = bus.consume(topic="ORDER_PROPOSED", target="Auditor", auto_ack=False)
+    orders = bus.consume(topic="ORDER_PROPOSED", target="Auditor")
     assert len(orders) == 1
     ord_event = orders[0]
 
@@ -121,6 +122,7 @@ def test_blackboard_end_to_end_flow(clean_blackboard):
         },
     )
     assert exec_id > 0
+    bus.update_status(approvals[0].id, EventStatus.COMPLETED)
 
     # STEP 5: Auditor consumes ORDER_EXECUTED, commits to journal
     execs = bus.consume(topic="ORDER_EXECUTED", target="Auditor")
@@ -136,6 +138,7 @@ def test_blackboard_end_to_end_flow(clean_blackboard):
     )
     assert journal_entry.trade_id == "SPD-TEST-001"
     assert journal_entry.status == "OPEN"
+    bus.update_status(execs[0].id, EventStatus.COMPLETED)
 
     # Close trade
     risk_guard.record_trade_exit("SPD-TEST-001", realized_pnl=650.0, current_time=sim_time)
@@ -192,3 +195,4 @@ def test_blackboard_auditor_veto_on_risk_breach(clean_blackboard):
     vetoes = bus.consume(topic="ORDER_VETOED", target="Coder")
     assert len(vetoes) == 1
     assert vetoes[0].payload["trade_id"] == "SPD-BAD-RISK"
+    bus.update_status(vetoes[0].id, EventStatus.COMPLETED)

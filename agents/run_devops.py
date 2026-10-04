@@ -29,7 +29,7 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from bus import SystemBus
+from bus import EventStatus, SystemBus
 from execution_engine import AngelAuth
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -115,6 +115,8 @@ def run_devops():
                     "timestamp": ts_str,
                 },
             )
+            # Mark consumed ORDER_APPROVED event as COMPLETED
+            bus.update_status(ev.id, EventStatus.COMPLETED)
             logger.info(f"Published ORDER_EXECUTED (Event #{eid}) to system_bus.db for Auditor.")
 
             # Queue for simulated trade resolution

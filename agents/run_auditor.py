@@ -65,8 +65,8 @@ def run_auditor():
     last_report_time = time.time()
 
     while True:
-        # 1. Audit proposed orders
-        orders = bus.consume(topic="ORDER_PROPOSED", target="Auditor", auto_ack=False)
+        # 1. Audit proposed orders (atomically transitions PENDING -> PROCESSING)
+        orders = bus.consume(topic="ORDER_PROPOSED", target="Auditor")
         for ev in orders:
             payload = ev.payload
             trade_id = payload["trade_id"]
@@ -139,6 +139,7 @@ def run_auditor():
                 timestamp=ts,
                 notes=payload.get("architect_signal", ""),
             )
+            bus.update_status(ev.id, EventStatus.COMPLETED)
             logger.info(f"[JOURNAL COMMITTED] Trade {trade_id} logged to SQLite. Slippage: {entry.entry_slippage} pts.")
 
         # 3. Consume position exits from DevOps
@@ -158,6 +159,7 @@ def run_auditor():
                 timestamp=ts,
                 notes=payload.get("exit_reason", ""),
             )
+            bus.update_status(ev.id, EventStatus.COMPLETED)
             logger.info(
                 f"[TRADE CLOSED & AUDITED] {trade_id} | Realized PnL: INR {realized_pnl:.2f} | "
                 f"MAE: INR {closed.mae_inr:.2f} | MFE: INR {closed.mfe_inr:.2f} | Day Total: INR {risk_guard.total_pnl:.2f}"

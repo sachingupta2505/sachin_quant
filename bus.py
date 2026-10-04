@@ -120,7 +120,9 @@ class SystemBus:
     ) -> list[BusEvent]:
         """
         Consumes all PENDING events matching the specified topic and target (or ALL).
-        If auto_ack is True, atomically marks them as COMPLETED.
+        If auto_ack is True, atomically marks them as PROCESSING so crashes can be detected.
+        Consuming agents must explicitly call update_status(event_id, EventStatus.COMPLETED)
+        or EventStatus.VETOED / EventStatus.FAILED once processing completes.
         """
         events: list[BusEvent] = []
 
@@ -151,14 +153,14 @@ class SystemBus:
                         target_agent=r["target_agent"],
                         topic=r["topic"],
                         payload=json.loads(r["payload"]),
-                        status=r["status"],
+                        status=EventStatus.PROCESSING.value if auto_ack else r["status"],
                     )
                 )
 
             if auto_ack and event_ids:
                 placeholders = ",".join("?" for _ in event_ids)
                 conn.execute(
-                    f"UPDATE bus_events SET status = 'COMPLETED' WHERE id IN ({placeholders})",
+                    f"UPDATE bus_events SET status = 'PROCESSING' WHERE id IN ({placeholders})",
                     event_ids,
                 )
                 conn.commit()

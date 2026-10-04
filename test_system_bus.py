@@ -36,7 +36,7 @@ def test_publish_and_consume_workflow(temp_bus: SystemBus):
     assert len(temp_bus.consume("ORDER_PROPOSED", target="Coder")) == 0
     assert len(temp_bus.consume("SIGNAL_DETECTED", target="Auditor")) == 0
 
-    # Correct topic & target consumes and marks COMPLETED
+    # Correct topic & target consumes and atomically marks PROCESSING
     consumed = temp_bus.consume("SIGNAL_DETECTED", target="Coder")
     assert len(consumed) == 1
     event = consumed[0]
@@ -45,14 +45,21 @@ def test_publish_and_consume_workflow(temp_bus: SystemBus):
     assert event.target_agent == "Coder"
     assert event.topic == "SIGNAL_DETECTED"
     assert event.payload["spot"] == 25000.0
+    assert event.status == EventStatus.PROCESSING.value
 
-    # Second consume should be empty (auto-acked to COMPLETED)
+    # Second consume should be empty (status is PROCESSING, not PENDING)
     assert len(temp_bus.consume("SIGNAL_DETECTED", target="Coder")) == 0
 
-    # Verify event record in DB is marked COMPLETED
+    # In DB, status is PROCESSING (enables crash detection)
+    assert temp_bus.get_event(eid).status == EventStatus.PROCESSING.value
+
+    # Consuming agent explicitly marks COMPLETED once work finishes
+    temp_bus.update_status(eid, EventStatus.COMPLETED)
+
+    # Verify event record in DB is now COMPLETED
     db_event = temp_bus.get_event(eid)
     assert db_event is not None
-    assert db_event.status == "COMPLETED"
+    assert db_event.status == EventStatus.COMPLETED.value
 
 
 def test_event_status_veto(temp_bus: SystemBus):

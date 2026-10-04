@@ -28,7 +28,7 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from bus import SystemBus
+from bus import EventStatus, SystemBus
 from execution_engine import SignalType, SpreadType
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -96,6 +96,7 @@ def run_coder():
                 logger.error(
                     f"[ORDER REJECTED] Cannot construct spread <= INR {MAX_PERMITTED_RISK_INR}. Aborting proposal."
                 )
+                bus.update_status(event.id, EventStatus.FAILED)
                 continue
 
             # Build legs
@@ -145,6 +146,8 @@ def run_coder():
                 target="Auditor",
                 payload=order_payload,
             )
+            # Mark consumed SIGNAL_DETECTED event as COMPLETED
+            bus.update_status(event.id, EventStatus.COMPLETED)
             logger.info(f"Published ORDER_PROPOSED (Event #{eid}) to system_bus.db for Auditor.")
 
         time.sleep(0.5)
