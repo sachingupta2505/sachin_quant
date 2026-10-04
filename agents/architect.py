@@ -22,6 +22,7 @@ from execution_engine import RejectionDetector, SignalType, SRZone
 
 IST = ZoneInfo("Asia/Kolkata")
 EXPIRY_CUTOFF_TIME: time = time(13, 30)  # 01:30 PM IST: Cut off new signals on expiry days to eliminate high-gamma risk
+MAX_INDIA_VIX: float = 24.0             # Volatility expansion limit: halt fresh entries if India VIX / IV expands violently (> 24.0)
 
 
 def is_expiry_day(dt: datetime) -> bool:
@@ -55,6 +56,14 @@ class ArchitectAgent(BaseAgent):
         if is_expiry_day(candle.timestamp) and candle.timestamp.time() >= EXPIRY_CUTOFF_TIME:
             self.logger.info(
                 f"[EXPIRY GAMMA CUTOFF] Signals blocked after {EXPIRY_CUTOFF_TIME.strftime('%H:%M')} IST on expiry days."
+            )
+            return
+
+        # Invariant: Volatility safety - halt entries if India VIX / IV expands violently (> 24.0)
+        current_vix = getattr(candle, "india_vix", 15.0)
+        if current_vix > MAX_INDIA_VIX:
+            self.logger.warning(
+                f"[VOLATILITY EXPANSION GATED] India VIX ({current_vix}) exceeds ceiling of {MAX_INDIA_VIX}. Halting fresh entries."
             )
             return
 

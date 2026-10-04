@@ -23,6 +23,7 @@ IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_SPREAD_WIDTH = 50.0
 DEFAULT_LOT_SIZE = 25  # Official NSE Nifty derivatives lot size
 MAX_PERMITTED_SPREAD_RISK_INR = 1500.0  # Must align with daily loss kill-switch
+MIN_NET_CREDIT_PTS = 10.0  # Theta/Credit capture math: minimum net credit threshold for positive risk-reward
 
 
 class CoderAgent(BaseAgent):
@@ -74,22 +75,23 @@ class CoderAgent(BaseAgent):
             net_premium_received = net_credit * self.lot_size
             risk_inr = (width * self.lot_size) - net_premium_received
 
-            if risk_inr <= MAX_PERMITTED_SPREAD_RISK_INR:
+            # Must satisfy both risk ceiling and minimum credit capture threshold
+            if risk_inr <= MAX_PERMITTED_SPREAD_RISK_INR and net_credit >= MIN_NET_CREDIT_PTS:
                 chosen_width = width
                 chosen_net_credit = net_credit
                 chosen_max_risk_inr = round(risk_inr, 2)
                 break
             else:
                 self.logger.warning(
-                    f"[RISK ADAPTATION] Width {width} pts yields Max Risk INR {risk_inr:.2f} > "
-                    f"limit INR {MAX_PERMITTED_SPREAD_RISK_INR:.2f}. Dynamically reducing spread width..."
+                    f"[RISK ADAPTATION] Width {width} pts yields Max Risk INR {risk_inr:.2f} (Credit: {net_credit:.1f} pts). "
+                    f"Evaluating next width..."
                 )
 
-        # If even the tightest candidate breaches the 1500 INR ceiling, REJECT the trade formulation
+        # If candidate breaches the 1500 INR ceiling or lacks minimum credit, REJECT the trade formulation
         if chosen_width is None:
             self.logger.error(
-                f"[TRADE FORMULATION REJECTED] Cannot construct defined-risk spread within "
-                f"hard limit of INR {MAX_PERMITTED_SPREAD_RISK_INR:.2f} (Lot size: {self.lot_size}). "
+                f"[TRADE FORMULATION REJECTED] Cannot construct defined-risk spread satisfying "
+                f"risk <= INR {MAX_PERMITTED_SPREAD_RISK_INR:.2f} and credit >= {MIN_NET_CREDIT_PTS} pts. "
                 f"Trade proposal aborted."
             )
             return

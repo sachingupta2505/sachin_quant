@@ -46,6 +46,16 @@ def validate_bid_ask_spread(bid: float, ask: float, max_ratio: float = MAX_BID_A
     return True, ratio, "Bid-ask spread within permissible liquidity tolerance"
 
 
+def validate_margin_sequencing(legs: list[dict]) -> bool:
+    """
+    Margin Protection Sequencing:
+    Asserts BUY leg executes prior to SELL leg to prevent broker margin rejection.
+    """
+    if len(legs) >= 2:
+        return legs[0].get("action") == "BUY" and legs[1].get("action") == "SELL"
+    return True
+
+
 class DevOpsAgent(BaseAgent):
     def __init__(
         self,
@@ -105,6 +115,9 @@ class DevOpsAgent(BaseAgent):
         trade_id = payload["trade_id"]
         legs = payload["legs"]
         ts = payload.get("timestamp") or datetime.now(self.tz)
+
+        # Margin Protection Sequencing: Assert BUY leg executes prior to SELL leg
+        assert validate_margin_sequencing(legs), "Margin protection violation: BUY leg must precede SELL leg"
 
         # Microstructure Guard: Validate bid-ask spread of hedge leg
         hedge_leg = next((l for l in legs if l.get("action") == "BUY"), legs[0])
