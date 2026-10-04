@@ -916,19 +916,14 @@ def main():
         success = check_broker_connectivity()
         sys.exit(0 if success else 1)
     elif args.dry_run:
-        success = run_dry_run()
+        from agents.master_executive import MasterExecutiveAgent
+        success = MasterExecutiveAgent(dry_run=True).run()
         sys.exit(0 if success else 1)
-    elif args.live:
-        run_live_market(
-            paper_trading=True,
-            poll_interval=args.poll_interval,
-        )
     else:
-        # Default behavior: run live market feed in paper trading mode
-        run_live_market(
-            paper_trading=True,
-            poll_interval=args.poll_interval,
-        )
+        # Default behavior: Execute MasterExecutiveAgent autonomous lifecycle
+        from agents.master_executive import MasterExecutiveAgent
+        success = MasterExecutiveAgent(dry_run=False).run()
+        sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":
