@@ -99,22 +99,22 @@ def run_coder():
                 bus.update_status(event.id, EventStatus.FAILED)
                 continue
 
-            # Build legs
+            # Build legs (Margin invariant: BUY leg MUST precede SELL leg)
             if signal_type == SignalType.BULLISH_REJECTION.value:
                 sell_strike = atm_strike
                 buy_strike = sell_strike - chosen_width
                 spread_type = SpreadType.BULL_PUT_SPREAD.value
                 legs = [
-                    {"symbol": f"NIFTY_{int(sell_strike)}_PE", "strike": sell_strike, "option_type": "PE", "action": "SELL", "quantity": LOT_SIZE, "price": 75.0},
                     {"symbol": f"NIFTY_{int(buy_strike)}_PE", "strike": buy_strike, "option_type": "PE", "action": "BUY", "quantity": LOT_SIZE, "price": 75.0 - chosen_credit},
+                    {"symbol": f"NIFTY_{int(sell_strike)}_PE", "strike": sell_strike, "option_type": "PE", "action": "SELL", "quantity": LOT_SIZE, "price": 75.0},
                 ]
             else:
                 sell_strike = atm_strike
                 buy_strike = sell_strike + chosen_width
                 spread_type = SpreadType.BEAR_CALL_SPREAD.value
                 legs = [
-                    {"symbol": f"NIFTY_{int(sell_strike)}_CE", "strike": sell_strike, "option_type": "CE", "action": "SELL", "quantity": LOT_SIZE, "price": 75.0},
                     {"symbol": f"NIFTY_{int(buy_strike)}_CE", "strike": buy_strike, "option_type": "CE", "action": "BUY", "quantity": LOT_SIZE, "price": 75.0 - chosen_credit},
+                    {"symbol": f"NIFTY_{int(sell_strike)}_CE", "strike": sell_strike, "option_type": "CE", "action": "SELL", "quantity": LOT_SIZE, "price": 75.0},
                 ]
 
             trade_id = f"SPD-{datetime.now(IST).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4].upper()}"

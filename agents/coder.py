@@ -95,21 +95,14 @@ class CoderAgent(BaseAgent):
             return
 
         if signal_type_str == SignalType.BULLISH_REJECTION.value:
-            # Bull Put Spread: Sell Put @ atm_strike, Buy Put @ atm_strike - chosen_width
+            # Bull Put Spread: Buy Put @ atm_strike - chosen_width (Hedge first), Sell Put @ atm_strike
             sell_strike = atm_strike
             buy_strike = sell_strike - chosen_width
             sell_prem = 75.0
             buy_prem = sell_prem - chosen_net_credit
 
+            # Margin requirement invariant: BUY leg MUST precede SELL leg
             legs = [
-                {
-                    "symbol": f"NIFTY_{int(sell_strike)}_PE",
-                    "strike": sell_strike,
-                    "option_type": "PE",
-                    "action": "SELL",
-                    "quantity": self.lot_size,
-                    "price": sell_prem,
-                },
                 {
                     "symbol": f"NIFTY_{int(buy_strike)}_PE",
                     "strike": buy_strike,
@@ -118,25 +111,26 @@ class CoderAgent(BaseAgent):
                     "quantity": self.lot_size,
                     "price": buy_prem,
                 },
+                {
+                    "symbol": f"NIFTY_{int(sell_strike)}_PE",
+                    "strike": sell_strike,
+                    "option_type": "PE",
+                    "action": "SELL",
+                    "quantity": self.lot_size,
+                    "price": sell_prem,
+                },
             ]
             spread_type = SpreadType.BULL_PUT_SPREAD.value
 
         elif signal_type_str == SignalType.BEARISH_REJECTION.value:
-            # Bear Call Spread: Sell Call @ atm_strike, Buy Call @ atm_strike + chosen_width
+            # Bear Call Spread: Buy Call @ atm_strike + chosen_width (Hedge first), Sell Call @ atm_strike
             sell_strike = atm_strike
             buy_strike = sell_strike + chosen_width
             sell_prem = 75.0
             buy_prem = sell_prem - chosen_net_credit
 
+            # Margin requirement invariant: BUY leg MUST precede SELL leg
             legs = [
-                {
-                    "symbol": f"NIFTY_{int(sell_strike)}_CE",
-                    "strike": sell_strike,
-                    "option_type": "CE",
-                    "action": "SELL",
-                    "quantity": self.lot_size,
-                    "price": sell_prem,
-                },
                 {
                     "symbol": f"NIFTY_{int(buy_strike)}_CE",
                     "strike": buy_strike,
@@ -144,6 +138,14 @@ class CoderAgent(BaseAgent):
                     "action": "BUY",
                     "quantity": self.lot_size,
                     "price": buy_prem,
+                },
+                {
+                    "symbol": f"NIFTY_{int(sell_strike)}_CE",
+                    "strike": sell_strike,
+                    "option_type": "CE",
+                    "action": "SELL",
+                    "quantity": self.lot_size,
+                    "price": sell_prem,
                 },
             ]
             spread_type = SpreadType.BEAR_CALL_SPREAD.value
