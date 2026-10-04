@@ -46,6 +46,7 @@ from regime_filter import InitialBalance, InitialBalanceTracker, MarketRegime, R
 from risk_guard import RiskGuard
 from audit_logger import AuditLogger
 from agents.architect import EXPIRY_CUTOFF_TIME, is_expiry_day
+from agents.notifier import TelegramNotifier, notifier_worker
 
 IST = ZoneInfo("Asia/Kolkata")
 LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "25"))
@@ -349,18 +350,21 @@ def auditor_worker(
             if max_risk_inr > MAX_PERMITTED_SPREAD_RISK_INR:
                 bus.update_status(ev.id, EventStatus.VETOED)
                 logger.warning(f"[AUDITOR] Vetoed {trade_id}: Max risk INR {max_risk_inr} > 1500 INR")
+                bus.publish(topic="ORDER_BLOCKED", source="Auditor", target="Notifier", payload={"trade_id": trade_id, "reason": f"Max risk INR {max_risk_inr} > 1500 INR"})
                 continue
 
             # Invariant 2: Daily loss limit
             if risk_guard.total_pnl <= MAX_DAILY_LOSS_INR:
                 bus.update_status(ev.id, EventStatus.VETOED)
                 logger.warning(f"[AUDITOR] Vetoed {trade_id}: Daily loss limit breached")
+                bus.publish(topic="ORDER_BLOCKED", source="Auditor", target="Notifier", payload={"trade_id": trade_id, "reason": "Daily loss limit breached"})
                 continue
 
             # Invariant 3: Daily trades limit
             if risk_guard.trade_count >= MAX_DAILY_TRADES:
                 bus.update_status(ev.id, EventStatus.VETOED)
                 logger.warning(f"[AUDITOR] Vetoed {trade_id}: Max daily trades reached")
+                bus.publish(topic="ORDER_BLOCKED", source="Auditor", target="Notifier", payload={"trade_id": trade_id, "reason": "Max daily trades reached"})
                 continue
 
             # Invariant 4: Time window gating
@@ -368,6 +372,7 @@ def auditor_worker(
             if not allowed:
                 bus.update_status(ev.id, EventStatus.VETOED)
                 logger.warning(f"[AUDITOR] Vetoed {trade_id}: {reason}")
+                bus.publish(topic="ORDER_BLOCKED", source="Auditor", target="Notifier", payload={"trade_id": trade_id, "reason": reason})
                 continue
 
             # Approved
@@ -457,6 +462,16 @@ def devops_worker(
                     "expected_entry_price": payload["net_credit"],
                     "is_paper": paper_trading,
                     "timestamp": ts_str,
+                },
+            )
+            bus.publish(
+                topic="ORDER_EXECUTED_ALERT",
+                source="DevOps",
+                target="Notifier",
+                payload={
+                    "trade_id": trade_id,
+                    "spread_type": payload.get("spread_type", "SPREAD"),
+                    "max_risk_inr": payload.get("max_risk_inr", 0.0),
                 },
             )
             bus.update_status(ev.id, EventStatus.COMPLETED)
@@ -605,11 +620,17 @@ def run_dry_run(db_path: str = "system_bus.db") -> bool:
             name="DevOpsWorker",
             daemon=True,
         ),
+        threading.Thread(
+            target=notifier_worker,
+            args=(SystemBus(db_path=db_path), stop_event),
+            name="NotifierWorker",
+            daemon=True,
+        ),
     ]
 
     for t in threads:
         t.start()
-    logger.info("All 4 agent worker threads started and actively polling bus.py.")
+    logger.info("All 5 agent worker threads started and actively polling bus.py.")
     time.sleep(0.2)
 
     logger.info("Publishing dummy test signal to bus.py for Architect...")
@@ -712,11 +733,20 @@ def run_live_market(
         threading.Thread(target=coder_worker, args=(SystemBus(db_path=db_path), internal_stop), name="CoderWorker", daemon=True),
         threading.Thread(target=auditor_worker, args=(SystemBus(db_path=db_path), internal_stop, None, state_file), name="AuditorWorker", daemon=True),
         threading.Thread(target=devops_worker, args=(SystemBus(db_path=db_path), internal_stop, None, paper_trading), name="DevOpsWorker", daemon=True),
+        threading.Thread(target=notifier_worker, args=(SystemBus(db_path=db_path), internal_stop), name="NotifierWorker", daemon=True),
     ]
 
     for t in threads:
         t.start()
-    logger.info("All 4 agents running concurrently over bus.py.")
+    logger.info("All 5 agents running concurrently over bus.py.")
+
+    # 09:14 IST: System Live & Broker Connected alert
+    bus.publish(
+        topic="SYSTEM_LIVE",
+        source="MainRunner",
+        target="Notifier",
+        payload={"message": "System Live & Broker Connected"},
+    )
 
     # 3. Market State & Aggregators
     aggregator = CandleAggregator(interval_minutes=5)
@@ -726,6 +756,7 @@ def run_live_market(
     ib_low = float("inf")
     tick_count = 0
     last_ib_log_time = 0.0
+    square_off_alert_sent = False
 
     logger.info("Entering live polling loop...")
 
@@ -740,9 +771,25 @@ def run_live_market(
                 time.sleep(min(15.0, poll_interval * 5))
                 continue
 
+            # 15:10 IST: Auto Square-off Alert
+            if current_time >= dtime(15, 10) and not square_off_alert_sent:
+                square_off_alert_sent = True
+                bus.publish(
+                    topic="POSITIONS_SQUARED_OFF",
+                    source="RiskGuard",
+                    target="Notifier",
+                    payload={"message": "All Positions Auto Squared-Off"},
+                )
+
             # Post-market shutdown (after 15:30)
             if current_time > dtime(15, 30) and max_ticks is None:
                 logger.info(f"[MARKET CLOSE] Current time is {now.strftime('%H:%M:%S')} IST. Regular market closed.")
+                bus.publish(
+                    topic="EOD_SUMMARY",
+                    source="AuditLogger",
+                    target="Notifier",
+                    payload={"count": tick_count, "pnl": 0.0},
+                )
                 break
 
             # Fetch live Nifty spot quote
@@ -794,6 +841,12 @@ def run_live_market(
                     f"Low: INR {final_low:.1f} | Range: {final_range:.1f} pts"
                 )
                 logger.info("=" * 65)
+                bus.publish(
+                    topic="INITIAL_BALANCE_LOCKED",
+                    source="LiveMarketFeed",
+                    target="Notifier",
+                    payload={"ib_high": final_high, "ib_low": final_low},
+                )
 
             # Phase 3: At 09:45 IST onwards - Emit completed 5-min candle closes to ArchitectAgent
             if closed_candle is not None:
