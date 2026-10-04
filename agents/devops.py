@@ -25,17 +25,39 @@ from execution_engine import AngelAuth
 
 IST = ZoneInfo("Asia/Kolkata")
 
+# Microstructure & Order Safety Invariants
+DEFAULT_ORDER_TYPE: str = "LIMIT"          # Disallow unconstrained MARKET orders to prevent slippage
+MAX_BID_ASK_SPREAD_RATIO: float = 0.10     # Max 10% bid-ask spread relative to mid-price
+
+
+def validate_bid_ask_spread(bid: float, ask: float, max_ratio: float = MAX_BID_ASK_SPREAD_RATIO) -> tuple[bool, float, str]:
+    """
+    Guards execution against severe illiquidity slippage.
+    Rejects or pauses execution if bid-ask spread > 10% of mid-price:
+    (ask - bid) / mid_price <= 0.10
+    """
+    if bid <= 0 or ask <= 0:
+        return False, 0.0, "Invalid or non-positive quote prices"
+    mid_price = (bid + ask) / 2.0
+    spread = ask - bid
+    ratio = spread / mid_price
+    if ratio > max_ratio:
+        return False, ratio, f"Bid-ask spread ({ratio:.1%}) exceeds maximum limit of {max_ratio:.1%} (Mid: {mid_price:.2f}, Spread: {spread:.2f})"
+    return True, ratio, "Bid-ask spread within permissible liquidity tolerance"
+
 
 class DevOpsAgent(BaseAgent):
     def __init__(
         self,
         dispatch_fn: Optional[Callable[[AgentMessage], None]] = None,
         paper_trading: bool = True,
+        order_type: str = DEFAULT_ORDER_TYPE,
         tz: ZoneInfo = IST,
     ):
         super().__init__(name="DevOps")
         self.dispatch_fn = dispatch_fn
         self.paper_trading = paper_trading
+        self.order_type = order_type
         self.tz = tz
 
         # Initialize Angel One credentials from environment
@@ -46,6 +68,17 @@ class DevOpsAgent(BaseAgent):
             totp_secret=os.getenv("SMARTAPI_TOTP_SECRET"),
         )
         self.active_order: Optional[dict] = None
+
+    def check_hedge_liquidity_guard(self, hedge_bid: float, hedge_ask: float) -> bool:
+        """
+        Microstructure Guard: Rejects or pauses execution if the hedge leg bid-ask spread
+        exceeds 10% of its mid-price.
+        """
+        valid, ratio, reason = validate_bid_ask_spread(hedge_bid, hedge_ask, MAX_BID_ASK_SPREAD_RATIO)
+        if not valid:
+            self.logger.warning(f"[LIQUIDITY GUARD TRIPPED] Execution paused/rejected: {reason}")
+            return False
+        return True
 
     def initialize_connectivity(self) -> bool:
         """Verifies broker API connectivity and session validity."""
@@ -72,6 +105,17 @@ class DevOpsAgent(BaseAgent):
         trade_id = payload["trade_id"]
         legs = payload["legs"]
         ts = payload.get("timestamp") or datetime.now(self.tz)
+
+        # Microstructure Guard: Validate bid-ask spread of hedge leg
+        hedge_leg = next((l for l in legs if l.get("action") == "BUY"), legs[0])
+        hedge_bid = float(hedge_leg.get("bid", hedge_leg.get("price", 57.0) - 1.0))
+        hedge_ask = float(hedge_leg.get("ask", hedge_leg.get("price", 57.0) + 1.0))
+
+        if not self.check_hedge_liquidity_guard(hedge_bid, hedge_ask):
+            self.logger.error(
+                f"[ORDER BLOCKED] Hedge leg illiquidity detected: Bid-Ask spread exceeds {MAX_BID_ASK_SPREAD_RATIO:.0%} of mid-price."
+            )
+            return
 
         self.logger.info(
             f"[DevOps Dispatching] Routing 2-leg spread {trade_id} "

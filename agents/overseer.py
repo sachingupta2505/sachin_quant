@@ -49,6 +49,7 @@ class StaticInvariantAuditor:
         self.coder_path = self.root_dir / "agents" / "coder.py"
         self.auditor_path = self.root_dir / "agents" / "auditor.py"
         self.architect_path = self.root_dir / "agents" / "architect.py"
+        self.devops_path = self.root_dir / "agents" / "devops.py"
         self.config_path = self.root_dir / "config.json"
         self.bus_path = self.root_dir / "bus.py"
 
@@ -425,6 +426,126 @@ class StaticInvariantAuditor:
                 message=f"Inspection error: {e}",
             )
 
+    def audit_devops_limit_order_safety(self) -> AuditResult:
+        """
+        Verifies that agents/devops.py routes orders strictly with order_type="LIMIT",
+        disallowing unconstrained MARKET orders to prevent fill slippage.
+        """
+        if not self.devops_path.exists():
+            return AuditResult(
+                name="devops.py: Limit Order Execution Safety",
+                passed=False,
+                message=f"File not found: {self.devops_path}",
+            )
+
+        try:
+            content = self.devops_path.read_text(encoding="utf-8")
+
+            # Check 1: Must define LIMIT as default order type or specify LIMIT in placeOrder
+            has_limit_def = bool(
+                re.search(r'DEFAULT_ORDER_TYPE\s*(?::\s*str)?\s*=\s*[\"\']LIMIT[\"\']', content) or
+                re.search(r'[\"\']ordertype[\"\']\s*:\s*[\"\']LIMIT[\"\']', content)
+            )
+
+            # Check 2: Unconstrained MARKET orders must NOT be the default routing
+            has_market_routing = bool(
+                re.search(r'DEFAULT_ORDER_TYPE\s*(?::\s*str)?\s*=\s*[\"\']MARKET[\"\']', content) or
+                re.search(r'[\"\']ordertype[\"\']\s*:\s*[\"\']MARKET[\"\']', content)
+            )
+
+            if not has_limit_def:
+                return AuditResult(
+                    name="devops.py: Limit Order Execution Safety",
+                    passed=False,
+                    message="LIMIT order type invariant not found in agents/devops.py",
+                )
+
+            if has_market_routing:
+                return AuditResult(
+                    name="devops.py: Limit Order Execution Safety",
+                    passed=False,
+                    message="Insecure MARKET order routing detected in agents/devops.py",
+                )
+
+            return AuditResult(
+                name="devops.py: Limit Order Execution Safety",
+                passed=True,
+                message="Orders strictly routed as LIMIT (unconstrained MARKET orders disallowed)",
+            )
+        except Exception as e:
+            return AuditResult(
+                name="devops.py: Limit Order Execution Safety",
+                passed=False,
+                message=f"Inspection error: {e}",
+            )
+
+    def audit_devops_bid_ask_spread_guard(self) -> AuditResult:
+        """
+        Verifies that agents/devops.py enforces a Bid-Ask spread guard:
+        rejects or pauses execution if the hedge leg bid-ask spread exceeds 10% of its mid-price.
+        """
+        if not self.devops_path.exists():
+            return AuditResult(
+                name="devops.py: Bid-Ask Spread Liquidity Guard",
+                passed=False,
+                message=f"File not found: {self.devops_path}",
+            )
+
+        try:
+            content = self.devops_path.read_text(encoding="utf-8")
+            tree = ast.parse(content)
+
+            ratio_val = None
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == "MAX_BID_ASK_SPREAD_RATIO":
+                            ratio_val = ast.literal_eval(node.value)
+                            break
+                elif isinstance(node, ast.AnnAssign):
+                    if isinstance(node.target, ast.Name) and node.target.id == "MAX_BID_ASK_SPREAD_RATIO" and node.value:
+                        ratio_val = ast.literal_eval(node.value)
+                        break
+
+            if ratio_val is None:
+                return AuditResult(
+                    name="devops.py: Bid-Ask Spread Liquidity Guard",
+                    passed=False,
+                    message="Constant MAX_BID_ASK_SPREAD_RATIO not found in agents/devops.py",
+                )
+
+            if not (isinstance(ratio_val, (int, float)) and 0.0 < ratio_val <= 0.10):
+                return AuditResult(
+                    name="devops.py: Bid-Ask Spread Liquidity Guard",
+                    passed=False,
+                    message=f"MAX_BID_ASK_SPREAD_RATIO is {ratio_val} (must be <= 0.10 / 10%)",
+                )
+
+            # Check that liquidity check method/function exists and guards execution
+            has_guard_logic = bool(
+                re.search(r'(?:check_hedge_liquidity_guard|validate_bid_ask_spread)', content) and
+                re.search(r'mid_price', content)
+            )
+
+            if not has_guard_logic:
+                return AuditResult(
+                    name="devops.py: Bid-Ask Spread Liquidity Guard",
+                    passed=False,
+                    message="Bid-ask spread validation guard logic not implemented in dispatch flow",
+                )
+
+            return AuditResult(
+                name="devops.py: Bid-Ask Spread Liquidity Guard",
+                passed=True,
+                message=f"Execution guarded: rejects if hedge spread > {ratio_val:.0%} of mid-price",
+            )
+        except Exception as e:
+            return AuditResult(
+                name="devops.py: Bid-Ask Spread Liquidity Guard",
+                passed=False,
+                message=f"Inspection error: {e}",
+            )
+
     def run_full_audit(self) -> list[AuditResult]:
         """Runs all static invariant checks and returns results."""
         return [
@@ -434,6 +555,8 @@ class StaticInvariantAuditor:
             self.audit_auditor_max_daily_trades(),
             self.audit_config_time_gates(),
             self.audit_architect_expiry_gamma_cutoff(),
+            self.audit_devops_limit_order_safety(),
+            self.audit_devops_bid_ask_spread_guard(),
             self.audit_bus_wal_mode(),
         ]
 

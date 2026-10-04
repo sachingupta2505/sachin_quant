@@ -15,19 +15,21 @@ from agents.overseer import StaticInvariantAuditor, AuditResult
 
 def test_overseer_static_audit_passes_on_current_codebase():
     """
-    Verifies that running StaticInvariantAuditor on current codebase passes all 7 checks:
+    Verifies that running StaticInvariantAuditor on current codebase passes all 9 checks:
     1. MAX_PERMITTED_SPREAD_RISK_INR <= 1500.0 (Coder)
     2. BUY leg precedes SELL leg (Coder - Broker margin safety)
     3. Hard daily loss limit <= -1500.0 INR (Auditor)
     4. Maximum daily trades <= 2 (Auditor)
     5. time_gates.entry_end == '15:05' & square_off == '15:10' (Config)
     6. Expiry day gamma cutoff 13:30 IST (Architect)
-    7. SQLite WAL mode in bus.py (Bus)
+    7. Orders strictly routed as LIMIT (DevOps)
+    8. Bid-Ask spread guard <= 10% (DevOps)
+    9. SQLite WAL mode in bus.py (Bus)
     """
     auditor = StaticInvariantAuditor()
     results = auditor.run_full_audit()
 
-    assert len(results) == 7
+    assert len(results) == 9
     for r in results:
         assert r.passed is True, f"Invariant check failed: {r.name} - {r.message}"
 
@@ -47,7 +49,7 @@ def test_overseer_cli_audit_command_exit_code():
     assert proc.returncode == 0
     stdout = proc.stdout
     assert "OVERSEER AGENT: STATIC INVARIANT AUDIT SCORECARD" in stdout
-    assert "TOTAL INVARIANTS: 7 | PASSED: 7 | FAILED: 0" in stdout
+    assert "TOTAL INVARIANTS: 9 | PASSED: 9 | FAILED: 0" in stdout
     assert "ALL INVARIANTS SATISFIED [PASS]" in stdout
 
 
@@ -156,3 +158,33 @@ def test_overseer_detects_missing_expiry_gamma_cutoff(tmp_path: Path):
     res = auditor.audit_architect_expiry_gamma_cutoff()
     assert res.passed is False
     assert "EXPIRY_CUTOFF_TIME = time(13, 30) not defined" in res.message
+
+
+def test_overseer_detects_market_order_violation(tmp_path: Path):
+    """
+    Verifies auditor flags violation if agents/devops.py routes unconstrained MARKET orders.
+    """
+    fake_agents = tmp_path / "agents"
+    fake_agents.mkdir(parents=True)
+    fake_devops = fake_agents / "devops.py"
+    fake_devops.write_text('DEFAULT_ORDER_TYPE = "MARKET"\norder_params = {"ordertype": "MARKET"}\n', encoding="utf-8")
+
+    auditor = StaticInvariantAuditor(root_dir=tmp_path)
+    res = auditor.audit_devops_limit_order_safety()
+    assert res.passed is False
+    assert "MARKET order routing detected" in res.message or "LIMIT order type invariant not found" in res.message
+
+
+def test_overseer_detects_excessive_spread_ratio(tmp_path: Path):
+    """
+    Verifies auditor flags violation if MAX_BID_ASK_SPREAD_RATIO > 10% in devops.py.
+    """
+    fake_agents = tmp_path / "agents"
+    fake_agents.mkdir(parents=True)
+    fake_devops = fake_agents / "devops.py"
+    fake_devops.write_text('MAX_BID_ASK_SPREAD_RATIO: float = 0.25\ndef check_hedge_liquidity_guard(): pass\n', encoding="utf-8")
+
+    auditor = StaticInvariantAuditor(root_dir=tmp_path)
+    res = auditor.audit_devops_bid_ask_spread_guard()
+    assert res.passed is False
+    assert "must be <= 0.10" in res.message
