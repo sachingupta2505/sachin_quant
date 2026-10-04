@@ -1,73 +1,38 @@
 """
-SQLite Multiprocess Message Bus for Decoupled Agents
-Enables inter-process communication between independent agent processes via bus.db.
-Configured with WAL mode and busy timeout for concurrent multi-process access.
+agents/bus.py - DEPRECATED ALIAS
+This module is deprecated in favor of root bus.py (SystemBus over system_bus.db).
+All agents and new code must strictly import SystemBus from root bus.py to prevent
+split-brain SQLite databases (bus.db vs system_bus.db).
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
-import time
-import uuid
-from dataclasses import dataclass
-from datetime import datetime
+import sys
+import warnings
 from pathlib import Path
 from typing import Any, Optional
-from zoneinfo import ZoneInfo
 
-IST = ZoneInfo("Asia/Kolkata")
-BUS_DB_PATH = Path("bus.db")
+# Add project root to sys.path
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
+from bus import BusEvent, EventStatus, SystemBus, bus
 
-@dataclass
-class BusMessage:
-    id: int
-    msg_id: str
-    sender: str
-    recipient: str
-    msg_type: str
-    payload: dict[str, Any]
-    timestamp: str
+warnings.warn(
+    "agents.bus is deprecated. Import SystemBus directly from root bus.py instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 
 class SQLiteMessageBus:
-    def __init__(self, db_path: str | Path = BUS_DB_PATH):
-        self.db_path = Path(db_path)
-        self._init_db()
+    """Deprecated compatibility adapter routing over SystemBus."""
 
-    def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        # Enable Write-Ahead Logging (WAL) for high-concurrency multi-process read/write
-        conn.execute("PRAGMA journal_mode = WAL;")
-        conn.execute("PRAGMA busy_timeout = 5000;")
-        return conn
-
-    def _init_db(self) -> None:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._get_connection() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    msg_id TEXT UNIQUE NOT NULL,
-                    sender TEXT NOT NULL,
-                    recipient TEXT NOT NULL,
-                    msg_type TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    processed INTEGER DEFAULT 0
-                );
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_messages_recipient_processed 
-                ON messages(recipient, processed);
-                """
-            )
-            conn.commit()
+    def __init__(self, db_path: str | Path = "system_bus.db"):
+        self.bus = SystemBus(db_path=db_path)
+        self.db_path = self.bus.db_path
 
     def publish(
         self,
@@ -75,62 +40,56 @@ class SQLiteMessageBus:
         recipient: str,
         msg_type: str,
         payload: dict[str, Any],
-        msg_id: Optional[str] = None,
     ) -> str:
-        """Publishes an event message to the bus for a target agent or broadcast."""
-        mid = msg_id or f"BUS-{uuid.uuid4().hex[:8].upper()}"
-        now_iso = datetime.now(IST).isoformat()
-        payload_json = json.dumps(payload, default=str)
+        eid = self.bus.publish(
+            topic=msg_type,
+            source=sender,
+            target=recipient,
+            payload=payload,
+        )
+        return f"BUS-{eid}"
 
-        with self._get_connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO messages (msg_id, sender, recipient, msg_type, payload, timestamp, processed)
-                VALUES (?, ?, ?, ?, ?, ?, 0)
-                """,
-                (mid, sender, recipient, msg_type, payload_json, now_iso),
-            )
-            conn.commit()
-        return mid
-
-    def poll(self, recipient: str, mark_processed: bool = True) -> list[BusMessage]:
-        """Polls for unprocessed messages targeted to `recipient` or 'ALL'."""
-        results: list[BusMessage] = []
-        with self._get_connection() as conn:
+    def poll(self, recipient: str, limit: int = 50) -> list[Any]:
+        with self.bus._get_connection() as conn:
             rows = conn.execute(
                 """
-                SELECT id, msg_id, sender, recipient, msg_type, payload, timestamp
-                FROM messages
-                WHERE (recipient = ? OR recipient = 'ALL') AND processed = 0
+                SELECT id, timestamp, source_agent, target_agent, topic, payload, status
+                FROM bus_events
+                WHERE (target_agent = ? OR target_agent = 'ALL')
+                  AND status = 'PENDING'
                 ORDER BY id ASC
+                LIMIT ?
                 """,
-                (recipient,),
+                (recipient, limit),
             ).fetchall()
 
             if not rows:
                 return []
 
-            ids_to_mark = []
+            results = []
+            ids = []
             for r in rows:
-                ids_to_mark.append(r["id"])
-                results.append(
-                    BusMessage(
-                        id=r["id"],
-                        msg_id=r["msg_id"],
-                        sender=r["sender"],
-                        recipient=r["recipient"],
-                        msg_type=r["msg_type"],
-                        payload=json.loads(r["payload"]),
-                        timestamp=r["timestamp"],
-                    )
-                )
+                ids.append(r["id"])
 
-            if mark_processed and ids_to_mark:
-                placeholders = ",".join("?" for _ in ids_to_mark)
-                conn.execute(
-                    f"UPDATE messages SET processed = 1 WHERE id IN ({placeholders})",
-                    ids_to_mark,
-                )
-                conn.commit()
+                class LegacyMessage:
+                    def __init__(self, row):
+                        self.id = row["id"]
+                        self.msg_id = f"BUS-{row['id']}"
+                        self.sender = row["source_agent"]
+                        self.recipient = row["target_agent"]
+                        self.msg_type = row["topic"]
+                        self.payload = json.loads(r["payload"]) if isinstance(r["payload"], str) else r["payload"]
+                        self.timestamp = row["timestamp"]
 
-        return results
+                results.append(LegacyMessage(r))
+
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(
+                f"UPDATE bus_events SET status = 'COMPLETED' WHERE id IN ({placeholders})",
+                ids,
+            )
+            conn.commit()
+            return results
+
+
+__all__ = ["SystemBus", "EventStatus", "BusEvent", "bus", "SQLiteMessageBus"]

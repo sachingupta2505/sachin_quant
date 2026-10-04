@@ -166,3 +166,61 @@ def test_post_market_analysis_and_eod_evolution(temp_env):
     # Verify JSON file written to reports_dir
     files = list(reports_dir.glob("eod_evolution_*.json"))
     assert len(files) == 1
+
+
+def test_chat_id_resolution_no_dummy_fallback(tmp_path, monkeypatch):
+    """Verify that if resolve_chat_id_for_user fails and TELEGRAM_CHAT_ID is dummy or empty, chat_id is None."""
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "6711295622")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("agents.master_executive.resolve_chat_id_for_user", lambda **kwargs: None)
+        agent = MasterExecutiveAgent(
+            db_path=tmp_path / "bus.db",
+            state_file=tmp_path / "state.json",
+            journal_db=tmp_path / "journal.db",
+            reports_dir=tmp_path / "reports",
+            dry_run=True,
+        )
+        assert agent.chat_id is None
+
+
+def test_supervision_with_six_workers(temp_env):
+    """Verify that MasterExecutiveAgent supervises all 6 agent worker threads."""
+    agent, _, _, _ = temp_env
+
+    stop_flags = {
+        "Architect": False,
+        "Coder": False,
+        "Auditor": False,
+        "DevOps": False,
+        "Notifier": False,
+        "LiveMarketFeed": False,
+    }
+
+    factories = {
+        name: (lambda n=name: threading.Thread(
+            target=lambda: [time.sleep(0.01) for _ in iter(lambda: stop_flags[n], True)],
+            name=f"{n}Worker"
+        ))
+        for name in stop_flags
+    }
+
+    agent.spawn_workers(factories)
+    assert len(agent.threads) == 6
+    for name in stop_flags:
+        assert agent.threads[name].is_alive()
+
+    # Kill LiveMarketFeed worker
+    stop_flags["LiveMarketFeed"] = True
+    agent.threads["LiveMarketFeed"].join(timeout=1.0)
+    assert not agent.threads["LiveMarketFeed"].is_alive()
+
+    # Resurrect
+    stop_flags["LiveMarketFeed"] = False
+    agent.supervise_workers(factories)
+    assert agent.threads["LiveMarketFeed"].is_alive()
+
+    # Cleanup
+    for n in stop_flags:
+        stop_flags[n] = True
+    agent.stop_event.set()
+

@@ -100,11 +100,26 @@ class MasterExecutiveAgent:
         # Gated Alerts Tracking (Strictly 5 Gated Alerts)
         self.gated_alerts_sent: set[str] = set()
 
-        # Resolve Telegram Chat ID
-        self.chat_id = resolve_chat_id_for_user(
+        # Resolve Telegram Chat ID safely (no dummy fallback)
+        DUMMY_CHAT_ID = "6711295622"
+        resolved_cid = resolve_chat_id_for_user(
             target_username=TARGET_TELEGRAM_USER,
             bot_token=TELEGRAM_BOT_TOKEN,
-        ) or os.getenv("TELEGRAM_CHAT_ID", "6711295622")
+        )
+        env_cid = os.getenv("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
+
+        if resolved_cid:
+            self.chat_id = resolved_cid
+        elif env_cid and env_cid != DUMMY_CHAT_ID:
+            self.chat_id = env_cid
+        else:
+            # resolve_chat_id_for_user failed and env is empty or dummy ID
+            self.chat_id = None
+            logger.warning(
+                f"[WARNING] Telegram chat ID could not be resolved for @{TARGET_TELEGRAM_USER} "
+                f"and TELEGRAM_CHAT_ID is empty or dummy ('{DUMMY_CHAT_ID}'). Alerts will not be dispatched "
+                "to dummy ID. Please send /start to @sachin_quant_9821_bot or set valid TELEGRAM_CHAT_ID in .env."
+            )
 
         self.notifier = TelegramNotifier(
             bot_token=TELEGRAM_BOT_TOKEN,
@@ -467,6 +482,7 @@ class MasterExecutiveAgent:
             check_broker_connectivity,
             coder_worker,
             devops_worker,
+            live_market_feed_worker,
             notifier_worker,
             run_dry_run,
         )
@@ -492,7 +508,7 @@ class MasterExecutiveAgent:
         # 2. Boot Gated Alert #1
         self.send_gated_alert("BOOT", "🚀 System Live & Broker Connected")
 
-        # 3. Setup multi-agent worker factories for supervision
+        # 3. Setup multi-agent worker factories for supervision (All 6 workers)
         worker_factories = {
             "Architect": lambda: threading.Thread(
                 target=architect_worker,
@@ -519,10 +535,15 @@ class MasterExecutiveAgent:
                 args=(SystemBus(db_path=self.db_path), self.stop_event, self.notifier),
                 name="NotifierWorker",
             ),
+            "LiveMarketFeed": lambda: threading.Thread(
+                target=live_market_feed_worker,
+                args=(SystemBus(db_path=self.db_path), self.stop_event),
+                name="LiveMarketFeedWorker",
+            ),
         }
 
         self.spawn_workers(worker_factories)
-        logger.info("[SUPERVISOR] All 5 multi-agent workers active under MasterExecutive supervision.")
+        logger.info("[SUPERVISOR] All 6 multi-agent workers active under MasterExecutive supervision.")
 
         # 4. Main Market Polling & Supervision Loop
         try:

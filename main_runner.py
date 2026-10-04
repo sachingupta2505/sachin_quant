@@ -685,6 +685,135 @@ def run_dry_run(db_path: str = "system_bus.db") -> bool:
     return True
 
 
+def live_market_feed_worker(
+    bus: SystemBus,
+    stop_event: threading.Event,
+    poll_interval: float = 2.0,
+    max_ticks: Optional[int] = None,
+) -> None:
+    """
+    LiveMarketFeed worker thread:
+    - Fetches live NIFTY 50 spot ticks via Angel One SmartAPI.
+    - Aggregates 5-minute OHLCV candles (CandleAggregator).
+    - Formulates Initial Balance (09:15-09:45 IST) and locks it at 09:45 IST.
+    - Emits MARKET_CANDLE events to Architect on bus.py.
+    """
+    auth = AngelAuth(
+        api_key=os.getenv("SMARTAPI_API_KEY"),
+        client_code=os.getenv("SMARTAPI_CLIENT_CODE"),
+        pin=os.getenv("SMARTAPI_PIN"),
+        totp_secret=os.getenv("SMARTAPI_TOTP_SECRET"),
+    )
+    if not auth.login() or not auth.smart_api:
+        logger.error("[LIVE FEED ERROR] Unable to authenticate with Angel One SmartAPI. Aborting LiveMarketFeed worker.")
+        return
+
+    logger.info("[LIVE FEED] Angel One session active. Starting tick ingestion loop...")
+
+    aggregator = CandleAggregator(interval_minutes=5)
+    ib_tracker = InitialBalanceTracker(tz=IST)
+    ib_locked = False
+    ib_high = 0.0
+    ib_low = float("inf")
+    tick_count = 0
+    last_ib_log_time = 0.0
+
+    while not stop_event.is_set():
+        now = datetime.now(IST)
+        current_time = now.time()
+
+        # Pre-market wait (before 09:15)
+        if current_time < dtime(9, 15) and max_ticks is None:
+            time.sleep(min(15.0, poll_interval * 5))
+            continue
+
+        # Post-market shutdown (after 15:30)
+        if current_time > dtime(15, 30) and max_ticks is None:
+            break
+
+        try:
+            resp = auth.smart_api.ltpData("NSE", "Nifty 50", "99926000")
+            if not resp or not resp.get("status"):
+                time.sleep(poll_interval)
+                continue
+
+            data = resp["data"]
+            ltp = float(data["ltp"])
+            tick_count += 1
+        except Exception as e:
+            logger.error(f"[LIVE FEED ERROR] Exception fetching live quote: {e}")
+            time.sleep(poll_interval)
+            continue
+
+        closed_candle = aggregator.on_tick(ltp=ltp, dt=now)
+
+        # Phase 1: From 09:15 to 09:45 IST - Formulate Initial Balance
+        if current_time < dtime(9, 45) and not ib_locked:
+            ib_high = max(ib_high, ltp)
+            ib_low = min(ib_low, ltp)
+            if closed_candle:
+                ib_tracker.ingest_ib_candle(closed_candle)
+
+            if time.time() - last_ib_log_time > 15.0:
+                last_ib_log_time = time.time()
+                logger.info(
+                    f"[IB FORMATION] {now.strftime('%H:%M:%S')} IST | Spot: {ltp:,.2f} | "
+                    f"IB High: {ib_high:,.1f} | IB Low: {ib_low:,.1f} | Range: {ib_high - ib_low:.1f} pts"
+                )
+
+        # Phase 2: At 09:45 IST - Lock Initial Balance
+        if current_time >= dtime(9, 45) and not ib_locked:
+            ib_locked = True
+            ib_tracker.lock_manual()
+            ib = ib_tracker.get_ib()
+            final_high = ib.high if ib.high > 0 else ib_high
+            final_low = ib.low if ib.low > 0 and ib.low < float("inf") else ib_low
+            final_range = final_high - final_low
+            logger.info("=" * 65)
+            logger.info(
+                f"[INITIAL BALANCE LOCKED at 09:45 IST] High: INR {final_high:.1f} | "
+                f"Low: INR {final_low:.1f} | Range: {final_range:.1f} pts"
+            )
+            logger.info("=" * 65)
+            bus.publish(
+                topic="INITIAL_BALANCE_LOCKED",
+                source="LiveMarketFeed",
+                target="ALL",
+                payload={"ib_high": final_high, "ib_low": final_low},
+            )
+
+        # Phase 3: At 09:45 IST onwards - Emit completed 5-min candle closes to ArchitectAgent
+        if closed_candle is not None:
+            candle_payload = {
+                "open": closed_candle.open,
+                "high": closed_candle.high,
+                "low": closed_candle.low,
+                "close": closed_candle.close,
+                "volume": closed_candle.volume,
+                "range": closed_candle.range,
+                "timestamp": closed_candle.timestamp.isoformat(),
+                "ib_high": ib_high,
+                "ib_low": ib_low,
+            }
+            eid = bus.publish(
+                topic="MARKET_CANDLE",
+                source="LiveMarketFeed",
+                target="Architect",
+                payload=candle_payload,
+            )
+            logger.info(
+                f"[CANDLE CLOSE EMITTED] {closed_candle.timestamp.strftime('%H:%M')} IST | "
+                f"O:{closed_candle.open:.1f} H:{closed_candle.high:.1f} L:{closed_candle.low:.1f} C:{closed_candle.close:.1f} -> Event #{eid}"
+            )
+
+        if max_ticks and tick_count >= max_ticks:
+            break
+
+        time.sleep(poll_interval)
+
+    logger.info("[LIVE FEED] Worker thread exiting cleanly.")
+
+
 def run_live_market(
     paper_trading: bool = True,
     poll_interval: float = 2.0,
