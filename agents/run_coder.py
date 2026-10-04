@@ -70,7 +70,7 @@ def run_coder():
             atm_strike = round(spot_price / 50.0) * 50.0
 
             # Dynamic candidate widths respecting MAX_PERMITTED_RISK_INR <= 1500
-            candidate_widths = [50.0]
+            candidate_widths = [100.0, 50.0]
             chosen_width = None
             chosen_credit = 0.0
             chosen_risk_inr = 0.0
@@ -79,7 +79,8 @@ def run_coder():
                 sell_prem = 75.0
                 buy_prem = max(57.0 - (width - 50.0) * 0.25, 20.0)
                 net_credit = sell_prem - buy_prem
-                risk_inr = (width * LOT_SIZE) - (net_credit * LOT_SIZE)
+                net_premium_received = net_credit * LOT_SIZE
+                risk_inr = (width * LOT_SIZE) - net_premium_received
 
                 if risk_inr <= MAX_PERMITTED_RISK_INR:
                     chosen_width = width
@@ -88,7 +89,7 @@ def run_coder():
                     break
                 else:
                     logger.warning(
-                        f"[RISK BREACH] Width {width} yields INR {risk_inr:.2f} > INR {MAX_PERMITTED_RISK_INR}"
+                        f"[RISK ADAPTATION] Width {width} yields INR {risk_inr:.2f} > INR {MAX_PERMITTED_RISK_INR}. Reducing width..."
                     )
 
             if chosen_width is None:

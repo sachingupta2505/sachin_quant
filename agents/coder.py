@@ -51,10 +51,14 @@ class CoderAgent(BaseAgent):
         # 1. Calculate ATM strike (nearest 50 pt boundary)
         atm_strike = round(spot_price / 50.0) * 50.0
 
-        # Candidate strike widths to test (starting from desired down to minimum 50 pt boundary)
-        candidate_widths = [self.spread_width]
-        if self.spread_width > 50.0:
-            candidate_widths.append(50.0)
+        # Candidate strike widths to test (starting from desired width down to minimum 50 pt boundary)
+        candidate_widths = []
+        w = float(self.spread_width)
+        while w >= 50.0:
+            candidate_widths.append(w)
+            w -= 50.0
+        if not candidate_widths:
+            candidate_widths = [50.0]
 
         chosen_width: Optional[float] = None
         chosen_net_credit: float = 0.0
@@ -66,8 +70,9 @@ class CoderAgent(BaseAgent):
             # Deeper OTM hedge is cheaper; for 50 pt width ~57 pt, for larger width cheaper
             buy_prem = max(57.0 - (width - 50.0) * 0.25, 20.0)
             net_credit = sell_prem - buy_prem
-            net_premium_inr = net_credit * self.lot_size
-            risk_inr = (width * self.lot_size) - net_premium_inr
+            # Max Risk = ((Spread Width in Points * Lot Size) - Net Premium Received)
+            net_premium_received = net_credit * self.lot_size
+            risk_inr = (width * self.lot_size) - net_premium_received
 
             if risk_inr <= MAX_PERMITTED_SPREAD_RISK_INR:
                 chosen_width = width
@@ -77,7 +82,7 @@ class CoderAgent(BaseAgent):
             else:
                 self.logger.warning(
                     f"[RISK ADAPTATION] Width {width} pts yields Max Risk INR {risk_inr:.2f} > "
-                    f"limit INR {MAX_PERMITTED_SPREAD_RISK_INR:.2f}. Attempting tighter strike width..."
+                    f"limit INR {MAX_PERMITTED_SPREAD_RISK_INR:.2f}. Dynamically reducing spread width..."
                 )
 
         # If even the tightest candidate breaches the 1500 INR ceiling, REJECT the trade formulation
