@@ -12,7 +12,7 @@ Responsibilities:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, time
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
@@ -21,6 +21,12 @@ from regime_filter import Candle, InitialBalance, MarketRegime, RegimeFilter
 from execution_engine import RejectionDetector, SignalType, SRZone
 
 IST = ZoneInfo("Asia/Kolkata")
+EXPIRY_CUTOFF_TIME: time = time(13, 30)  # 01:30 PM IST: Cut off new signals on expiry days to eliminate high-gamma risk
+
+
+def is_expiry_day(dt: datetime) -> bool:
+    """NSE Nifty weekly options contracts expire on Thursdays (weekday 3)."""
+    return dt.weekday() == 3
 
 
 class ArchitectAgent(BaseAgent):
@@ -36,12 +42,22 @@ class ArchitectAgent(BaseAgent):
         self.rejection_detector = RejectionDetector()
         self._recent_candles: list[Candle] = []
 
+    def is_expiry_day(self, dt: datetime) -> bool:
+        return is_expiry_day(dt)
+
     def handle_message(self, message: AgentMessage) -> None:
         if message.msg_type == MessageType.MARKET_CANDLE:
             candle: Candle = message.payload["candle"]
             self.on_candle(candle)
 
     def on_candle(self, candle: Candle) -> None:
+        # Invariant: Restrict new strategy signals after 13:30 IST on expiry days to eliminate high-gamma risk
+        if is_expiry_day(candle.timestamp) and candle.timestamp.time() >= EXPIRY_CUTOFF_TIME:
+            self.logger.info(
+                f"[EXPIRY GAMMA CUTOFF] Signals blocked after {EXPIRY_CUTOFF_TIME.strftime('%H:%M')} IST on expiry days."
+            )
+            return
+
         self._recent_candles.append(candle)
         if len(self._recent_candles) > 50:
             self._recent_candles.pop(0)

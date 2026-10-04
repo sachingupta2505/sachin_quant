@@ -15,17 +15,19 @@ from agents.overseer import StaticInvariantAuditor, AuditResult
 
 def test_overseer_static_audit_passes_on_current_codebase():
     """
-    Verifies that running StaticInvariantAuditor on current codebase passes all 5 checks:
+    Verifies that running StaticInvariantAuditor on current codebase passes all 7 checks:
     1. MAX_PERMITTED_SPREAD_RISK_INR <= 1500.0 (Coder)
     2. BUY leg precedes SELL leg (Coder - Broker margin safety)
     3. Hard daily loss limit <= -1500.0 INR (Auditor)
     4. Maximum daily trades <= 2 (Auditor)
-    5. SQLite WAL mode in bus.py (Bus)
+    5. time_gates.entry_end == '15:05' & square_off == '15:10' (Config)
+    6. Expiry day gamma cutoff 13:30 IST (Architect)
+    7. SQLite WAL mode in bus.py (Bus)
     """
     auditor = StaticInvariantAuditor()
     results = auditor.run_full_audit()
 
-    assert len(results) == 5
+    assert len(results) == 7
     for r in results:
         assert r.passed is True, f"Invariant check failed: {r.name} - {r.message}"
 
@@ -45,7 +47,7 @@ def test_overseer_cli_audit_command_exit_code():
     assert proc.returncode == 0
     stdout = proc.stdout
     assert "OVERSEER AGENT: STATIC INVARIANT AUDIT SCORECARD" in stdout
-    assert "TOTAL INVARIANTS: 5 | PASSED: 5 | FAILED: 0" in stdout
+    assert "TOTAL INVARIANTS: 7 | PASSED: 7 | FAILED: 0" in stdout
     assert "ALL INVARIANTS SATISFIED [PASS]" in stdout
 
 
@@ -126,3 +128,31 @@ def test_overseer_detects_max_trades_breach(tmp_path: Path):
     res = auditor.audit_auditor_max_daily_trades()
     assert res.passed is False
     assert "exceeds hard cap of 2 trades/day" in res.message
+
+
+def test_overseer_detects_time_gate_breach(tmp_path: Path):
+    """
+    Verifies auditor flags violation if time_gates in config.json breach 15:05 or 15:10.
+    """
+    fake_config = tmp_path / "config.json"
+    fake_config.write_text('{"time_gates": {"entry_end": "15:20", "square_off": "15:30"}}', encoding="utf-8")
+
+    auditor = StaticInvariantAuditor(root_dir=tmp_path)
+    res = auditor.audit_config_time_gates()
+    assert res.passed is False
+    assert "expected strictly '15:05'" in res.message
+
+
+def test_overseer_detects_missing_expiry_gamma_cutoff(tmp_path: Path):
+    """
+    Verifies auditor flags violation if agents/architect.py lacks EXPIRY_CUTOFF_TIME = time(13, 30).
+    """
+    fake_agents = tmp_path / "agents"
+    fake_agents.mkdir(parents=True)
+    fake_arch = fake_agents / "architect.py"
+    fake_arch.write_text("class ArchitectAgent: pass\n", encoding="utf-8")
+
+    auditor = StaticInvariantAuditor(root_dir=tmp_path)
+    res = auditor.audit_architect_expiry_gamma_cutoff()
+    assert res.passed is False
+    assert "EXPIRY_CUTOFF_TIME = time(13, 30) not defined" in res.message

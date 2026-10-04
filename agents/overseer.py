@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -47,6 +48,8 @@ class StaticInvariantAuditor:
         self.root_dir = root_dir or Path(__file__).parent.parent
         self.coder_path = self.root_dir / "agents" / "coder.py"
         self.auditor_path = self.root_dir / "agents" / "auditor.py"
+        self.architect_path = self.root_dir / "agents" / "architect.py"
+        self.config_path = self.root_dir / "config.json"
         self.bus_path = self.root_dir / "bus.py"
 
     def audit_coder_max_risk(self) -> AuditResult:
@@ -325,6 +328,103 @@ class StaticInvariantAuditor:
                 message=f"Audit inspection error: {e}",
             )
 
+    def audit_config_time_gates(self) -> AuditResult:
+        """
+        Verifies that config.json strictly enforces:
+        - time_gates.entry_end == "15:05"
+        - time_gates.square_off == "15:10"
+        """
+        if not self.config_path.exists():
+            return AuditResult(
+                name="config.json: Mandatory Time-Gates",
+                passed=False,
+                message=f"File not found: {self.config_path}",
+            )
+
+        try:
+            data = json.loads(self.config_path.read_text(encoding="utf-8"))
+            time_gates = data.get("time_gates", {})
+
+            entry_end = time_gates.get("entry_end")
+            square_off = time_gates.get("square_off")
+
+            if entry_end != "15:05":
+                return AuditResult(
+                    name="config.json: Mandatory Time-Gates",
+                    passed=False,
+                    message=f"time_gates.entry_end is '{entry_end}', expected strictly '15:05'",
+                )
+
+            if square_off != "15:10":
+                return AuditResult(
+                    name="config.json: Mandatory Time-Gates",
+                    passed=False,
+                    message=f"time_gates.square_off is '{square_off}', expected strictly '15:10'",
+                )
+
+            return AuditResult(
+                name="config.json: Mandatory Time-Gates",
+                passed=True,
+                message="entry_end='15:05' & square_off='15:10' strictly configured",
+            )
+        except Exception as e:
+            return AuditResult(
+                name="config.json: Mandatory Time-Gates",
+                passed=False,
+                message=f"JSON parse error: {e}",
+            )
+
+    def audit_architect_expiry_gamma_cutoff(self) -> AuditResult:
+        """
+        Verifies that agents/architect.py restricts new strategy signals after 13:30 IST
+        on weekly/monthly expiry days to eliminate high-gamma risk.
+        """
+        if not self.architect_path.exists():
+            return AuditResult(
+                name="architect.py: Expiry Gamma Cutoff (13:30 IST)",
+                passed=False,
+                message=f"File not found: {self.architect_path}",
+            )
+
+        try:
+            content = self.architect_path.read_text(encoding="utf-8")
+
+            # Check 1: EXPIRY_CUTOFF_TIME constant or 13:30 check
+            has_cutoff_const = bool(
+                re.search(r'EXPIRY_CUTOFF_TIME\s*(?::\s*time)?\s*=\s*time\(\s*13\s*,\s*30\s*\)', content)
+            )
+            # Check 2: Check for expiry day gating in on_candle or signal flow
+            has_expiry_gate = bool(
+                re.search(r'is_expiry_day\s*\(.*?\)\s*and\s*.*?EXPIRY_CUTOFF_TIME', content) or
+                re.search(r'is_expiry_day\s*\(.*?\)\s*and\s*.*?13\s*,\s*30', content)
+            )
+
+            if not has_cutoff_const:
+                return AuditResult(
+                    name="architect.py: Expiry Gamma Cutoff (13:30 IST)",
+                    passed=False,
+                    message="Constant EXPIRY_CUTOFF_TIME = time(13, 30) not defined in agents/architect.py",
+                )
+
+            if not has_expiry_gate:
+                return AuditResult(
+                    name="architect.py: Expiry Gamma Cutoff (13:30 IST)",
+                    passed=False,
+                    message="Expiry day 13:30 cutoff condition not enforced in signal workflow",
+                )
+
+            return AuditResult(
+                name="architect.py: Expiry Gamma Cutoff (13:30 IST)",
+                passed=True,
+                message="Signals strictly blocked after 13:30 IST on expiry days (Gamma Risk Mitigated)",
+            )
+        except Exception as e:
+            return AuditResult(
+                name="architect.py: Expiry Gamma Cutoff (13:30 IST)",
+                passed=False,
+                message=f"Inspection error: {e}",
+            )
+
     def run_full_audit(self) -> list[AuditResult]:
         """Runs all static invariant checks and returns results."""
         return [
@@ -332,6 +432,8 @@ class StaticInvariantAuditor:
             self.audit_coder_leg_ordering(),
             self.audit_auditor_daily_loss_limit(),
             self.audit_auditor_max_daily_trades(),
+            self.audit_config_time_gates(),
+            self.audit_architect_expiry_gamma_cutoff(),
             self.audit_bus_wal_mode(),
         ]
 

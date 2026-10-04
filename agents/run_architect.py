@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from bus import SystemBus
 from execution_engine import RejectionDetector, SignalType
 from regime_filter import Candle, InitialBalance, MarketRegime, RegimeFilter
+from agents.architect import EXPIRY_CUTOFF_TIME, is_expiry_day
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -128,6 +129,13 @@ def run_architect():
             # Evaluate regime
             regime = regime_filter.evaluate_regime(recent_candles, current_time=c.timestamp)
             logger.info(f"[REGIME] {regime.regime.value}: {regime.description}")
+
+            # Enforce expiry day 13:30 cutoff to eliminate high-gamma risk
+            if is_expiry_day(c.timestamp) and c.timestamp.time() >= EXPIRY_CUTOFF_TIME:
+                logger.info(
+                    f"[EXPIRY GAMMA CUTOFF] Signals blocked after {EXPIRY_CUTOFF_TIME.strftime('%H:%M')} IST on expiry day."
+                )
+                continue
 
             if regime.is_favorable_for_spread:
                 zones = rejection_detector.identify_sr_zones(ib=ib, spot_price=c.close)
