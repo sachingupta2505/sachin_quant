@@ -1,0 +1,534 @@
+"""
+Execution Engine Module for Algorithmic Trading Engine
+Features:
+1. Angel One SmartAPI integration with TOTP authentication (pyotp).
+2. Support & Resistance zones calculation.
+3. 5-min rejection candle detection (wick ratio >= 50%).
+4. Defined-risk option spread executor (Paper Trading toggle enabled by default).
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Optional, Sequence
+from zoneinfo import ZoneInfo
+
+import pyotp
+from SmartApi import SmartConnect
+
+from regime_filter import Candle, InitialBalance
+from risk_guard import RiskGuard, RiskState
+
+logger = logging.getLogger("execution_engine")
+IST = ZoneInfo("Asia/Kolkata")
+NIFTY_LOT_SIZE = 25  # Official NSE Nifty derivatives lot size
+MAX_SPREAD_RISK_INR = 1500.0  # Hard single-spread risk ceiling (aligned with daily kill-switch)
+
+
+class SignalType(str, Enum):
+    BULLISH_REJECTION = "BULLISH_REJECTION"  # Long wick rejected at Support
+    BEARISH_REJECTION = "BEARISH_REJECTION"  # Long wick rejected at Resistance
+    NONE = "NONE"
+
+
+class SpreadType(str, Enum):
+    BULL_PUT_SPREAD = "BULL_PUT_SPREAD"      # Bullish: Sell ATM Put, Buy OTM Put hedge
+    BEAR_CALL_SPREAD = "BEAR_CALL_SPREAD"    # Bearish: Sell ATM Call, Buy OTM Call hedge
+
+
+@dataclass
+class SRZone:
+    """Support or Resistance price level with upper and lower tolerance bands."""
+    name: str
+    level: float
+    band_pts: float = 12.0  # +/- 12 points buffer on Nifty
+
+    @property
+    def upper(self) -> float:
+        return self.level + self.band_pts
+
+    @property
+    def lower(self) -> float:
+        return self.level - self.band_pts
+
+    def touches_or_penetrates(self, low: float, high: float) -> bool:
+        return not (high < self.lower or low > self.upper)
+
+
+@dataclass
+class RejectionSignal:
+    signal_type: SignalType
+    candle: Candle
+    wick_ratio: float
+    zone: SRZone
+    confidence: float
+    description: str
+
+
+@dataclass
+class SpreadLeg:
+    symbol: str
+    strike: float
+    option_type: str  # "CE" or "PE"
+    action: str       # "BUY" or "SELL"
+    quantity: int
+    price: float
+    order_id: Optional[str] = None
+
+
+@dataclass
+class SpreadTrade:
+    trade_id: str
+    spread_type: SpreadType
+    legs: list[SpreadLeg]
+    net_credit: float
+    max_risk_inr: float
+    max_reward_inr: float
+    timestamp: datetime
+    is_paper: bool = True
+    status: str = "OPEN"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class AngelAuth:
+    """
+    Manages authentication with Angel One SmartAPI using TOTP generation.
+    Supports mock/paper session for offline testing or credentials-free simulation.
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        client_code: Optional[str] = None,
+        pin: Optional[str] = None,
+        totp_secret: Optional[str] = None,
+    ):
+        self.api_key = api_key
+        self.client_code = client_code
+        self.pin = pin
+        self.totp_secret = totp_secret
+        self.smart_api: Optional[SmartConnect] = None
+        self.auth_token: Optional[str] = None
+        self.feed_token: Optional[str] = None
+        self.refresh_token: Optional[str] = None
+        self.is_authenticated: bool = False
+
+    def generate_totp(self) -> str:
+        if not self.totp_secret:
+            raise ValueError("TOTP secret not configured")
+        totp = pyotp.TOTP(self.totp_secret)
+        return totp.now()
+
+    def login(self) -> bool:
+        """
+        Authenticates with Angel One SmartAPI using TOTP.
+        """
+        if not all([self.api_key, self.client_code, self.pin, self.totp_secret]):
+            logger.warning("Angel One credentials incomplete. Operating in Mock/Paper authentication mode.")
+            self.is_authenticated = False
+            return False
+
+        try:
+            self.smart_api = SmartConnect(api_key=self.api_key)
+            totp_code = self.generate_totp()
+            data = self.smart_api.generateSession(self.client_code, self.pin, totp_code)
+
+            if data and data.get("status"):
+                self.auth_token = data["data"]["jwtToken"]
+                self.feed_token = data["data"]["feedToken"]
+                self.refresh_token = data["data"]["refreshToken"]
+                self.is_authenticated = True
+                logger.info(f"Successfully authenticated with Angel One SmartAPI for {self.client_code}")
+                return True
+            else:
+                logger.error(f"Angel One login failed: {data}")
+                self.is_authenticated = False
+                return False
+        except Exception as e:
+            logger.error(f"Exception during Angel One authentication: {e}")
+            self.is_authenticated = False
+            return False
+
+
+class RejectionDetector:
+    """
+    Detects 5-minute rejection candles (wick ratio >= 50%) at Key S/R zones.
+    """
+
+    def __init__(self, min_wick_ratio: float = 0.50, min_candle_range: float = 12.0):
+        self.min_wick_ratio = min_wick_ratio
+        self.min_candle_range = min_candle_range  # Minimum range (in pts) to filter out micro-noise bars
+
+    def identify_sr_zones(
+        self,
+        ib: Optional[InitialBalance],
+        spot_price: float,
+        swing_highs: Optional[Sequence[float]] = None,
+        swing_lows: Optional[Sequence[float]] = None,
+    ) -> list[SRZone]:
+        """
+        Computes key Support & Resistance zones using Initial Balance (IBH/IBL)
+        and psychological/strike levels (multiples of 50/100).
+        """
+        zones: list[SRZone] = []
+
+        if ib is not None:
+            zones.append(SRZone(name="IB_HIGH_RESISTANCE", level=ib.high))
+            zones.append(SRZone(name="IB_LOW_SUPPORT", level=ib.low))
+
+        # Psychological / Strike boundaries (nearest 50-pt strikes around spot)
+        base = round(spot_price / 50.0) * 50.0
+        zones.append(SRZone(name=f"STRIKE_RES_{int(base + 50)}", level=base + 50.0))
+        zones.append(SRZone(name=f"STRIKE_SUP_{int(base - 50)}", level=base - 50.0))
+
+        if swing_highs:
+            for i, sh in enumerate(swing_highs):
+                zones.append(SRZone(name=f"SWING_HIGH_{i+1}", level=sh))
+        if swing_lows:
+            for i, sl in enumerate(swing_lows):
+                zones.append(SRZone(name=f"SWING_LOW_{i+1}", level=sl))
+
+        return zones
+
+    def detect_rejection(
+        self,
+        candle: Candle,
+        zones: Sequence[SRZone],
+    ) -> RejectionSignal:
+        """
+        Detects if a 5-minute candle forms a high-probability rejection:
+        - Candle range >= min_candle_range (avoid noise)
+        - Rejection wick / range >= 50%
+        - Rejection wick tests an S/R zone
+        - Close confirms rejection direction
+        """
+        c_range = candle.range
+        if c_range < self.min_candle_range:
+            return RejectionSignal(
+                signal_type=SignalType.NONE,
+                candle=candle,
+                wick_ratio=0.0,
+                zone=SRZone(name="NONE", level=0.0),
+                confidence=0.0,
+                description="Candle range below minimum threshold.",
+            )
+
+        # 1. Check Bullish Rejection (Hammer / Pin bar at Support)
+        lower_wick_ratio = candle.lower_wick / c_range
+        if lower_wick_ratio >= self.min_wick_ratio:
+            # Must close in upper 50% of the bar
+            if candle.close >= (candle.low + 0.5 * c_range):
+                for zone in zones:
+                    # Candle dipped into or tested the support zone
+                    if zone.touches_or_penetrates(candle.low, candle.low + candle.lower_wick):
+                        return RejectionSignal(
+                            signal_type=SignalType.BULLISH_REJECTION,
+                            candle=candle,
+                            wick_ratio=round(lower_wick_ratio, 3),
+                            zone=zone,
+                            confidence=min(round(lower_wick_ratio * 1.2, 2), 1.0),
+                            description=(
+                                f"Bullish Rejection at {zone.name} ({zone.level:.1f}): "
+                                f"Lower wick {candle.lower_wick:.1f} pts is {lower_wick_ratio * 100:.1f}% "
+                                f"of candle range ({c_range:.1f} pts)."
+                            ),
+                        )
+
+        # 2. Check Bearish Rejection (Shooting Star / Pin bar at Resistance)
+        upper_wick_ratio = candle.upper_wick / c_range
+        if upper_wick_ratio >= self.min_wick_ratio:
+            # Must close in lower 50% of the bar
+            if candle.close <= (candle.high - 0.5 * c_range):
+                for zone in zones:
+                    # Candle spiked into or tested the resistance zone
+                    if zone.touches_or_penetrates(candle.high - candle.upper_wick, candle.high):
+                        return RejectionSignal(
+                            signal_type=SignalType.BEARISH_REJECTION,
+                            candle=candle,
+                            wick_ratio=round(upper_wick_ratio, 3),
+                            zone=zone,
+                            confidence=min(round(upper_wick_ratio * 1.2, 2), 1.0),
+                            description=(
+                                f"Bearish Rejection at {zone.name} ({zone.level:.1f}): "
+                                f"Upper wick {candle.upper_wick:.1f} pts is {upper_wick_ratio * 100:.1f}% "
+                                f"of candle range ({c_range:.1f} pts)."
+                            ),
+                        )
+
+        return RejectionSignal(
+            signal_type=SignalType.NONE,
+            candle=candle,
+            wick_ratio=max(lower_wick_ratio, upper_wick_ratio),
+            zone=SRZone(name="NONE", level=0.0),
+            confidence=0.0,
+            description="No rejection criteria met.",
+        )
+
+
+class ExecutionEngine:
+    """
+    Defined-risk option spread executor.
+    Supports paper trading (default) and live Angel One SmartAPI order routing.
+    Strictly gates all executions with RiskGuard.
+    """
+
+    def __init__(
+        self,
+        risk_guard: RiskGuard,
+        auth: Optional[AngelAuth] = None,
+        paper_trading: bool = True,  # Paper trading enabled by default
+        lot_size: int = NIFTY_LOT_SIZE,
+        spread_width_pts: float = 50.0,
+        tz: ZoneInfo = IST,
+    ):
+        self.risk_guard = risk_guard
+        self.auth = auth or AngelAuth()
+        self.paper_trading = paper_trading
+        self.lot_size = lot_size
+        self.spread_width_pts = spread_width_pts
+        self.tz = tz
+        self.active_spread: Optional[SpreadTrade] = None
+        self.executed_trades: list[SpreadTrade] = []
+
+    def build_spread(
+        self,
+        signal: RejectionSignal,
+        spot_price: float,
+        timestamp: Optional[datetime] = None,
+    ) -> Optional[SpreadTrade]:
+        """
+        Constructs a defined-risk 2-leg credit spread based on rejection signal:
+        - Bullish Rejection -> Bull Put Spread:
+          * Sell ATM/near-OTM Put (Strike K)
+          * Buy OTM Put hedge (Strike K - 50)
+        - Bearish Rejection -> Bear Call Spread:
+          * Sell ATM/near-OTM Call (Strike K)
+          * Buy OTM Call hedge (Strike K + 50)
+        """
+        if signal.signal_type == SignalType.NONE:
+            return None
+
+        dt = timestamp or signal.candle.timestamp
+        trade_id = f"SPD-{dt.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4].upper()}"
+
+        # Nearest 50-pt strike
+        atm_strike = round(spot_price / 50.0) * 50.0
+
+        # Dynamic strike width selection respecting MAX_SPREAD_RISK_INR <= 1500.0
+        candidate_widths = [self.spread_width_pts]
+        if self.spread_width_pts > 50.0:
+            candidate_widths.append(50.0)
+
+        chosen_width: Optional[float] = None
+        chosen_net_credit: float = 0.0
+        chosen_max_risk_inr: float = 0.0
+
+        for width in candidate_widths:
+            sell_prem = 75.0
+            buy_prem = max(57.0 - (width - 50.0) * 0.25, 20.0)
+            net_credit = sell_prem - buy_prem
+            risk_inr = (width * self.lot_size) - (net_credit * self.lot_size)
+
+            if risk_inr <= MAX_SPREAD_RISK_INR:
+                chosen_width = width
+                chosen_net_credit = net_credit
+                chosen_max_risk_inr = round(risk_inr, 2)
+                break
+            else:
+                logger.warning(
+                    f"[RISK ADAPTATION] Width {width} pts yields Max Risk INR {risk_inr:.2f} > "
+                    f"limit INR {MAX_SPREAD_RISK_INR:.2f}. Attempting tighter strike width..."
+                )
+
+        if chosen_width is None:
+            logger.error(
+                f"[TRADE FORMULATION REJECTED] Cannot construct defined-risk spread within "
+                f"hard limit of INR {MAX_SPREAD_RISK_INR:.2f} (Lot size: {self.lot_size}). "
+                f"Trade proposal aborted."
+            )
+            return None
+
+        if signal.signal_type == SignalType.BULLISH_REJECTION:
+            # Bull Put Spread: Sell Put at atm_strike, Buy Put at atm_strike - chosen_width
+            sell_strike = atm_strike
+            buy_strike = sell_strike - chosen_width
+            sell_prem = 75.0
+            buy_prem = sell_prem - chosen_net_credit
+
+            legs = [
+                SpreadLeg(
+                    symbol=f"NIFTY_{int(sell_strike)}_PE",
+                    strike=sell_strike,
+                    option_type="PE",
+                    action="SELL",
+                    quantity=self.lot_size,
+                    price=sell_prem,
+                ),
+                SpreadLeg(
+                    symbol=f"NIFTY_{int(buy_strike)}_PE",
+                    strike=buy_strike,
+                    option_type="PE",
+                    action="BUY",
+                    quantity=self.lot_size,
+                    price=buy_prem,
+                ),
+            ]
+
+            max_reward_inr = round(chosen_net_credit * self.lot_size, 2)
+
+            return SpreadTrade(
+                trade_id=trade_id,
+                spread_type=SpreadType.BULL_PUT_SPREAD,
+                legs=legs,
+                net_credit=chosen_net_credit,
+                max_risk_inr=chosen_max_risk_inr,
+                max_reward_inr=max_reward_inr,
+                timestamp=dt,
+                is_paper=self.paper_trading,
+                metadata={"signal": signal.description, "spot": spot_price, "width": chosen_width},
+            )
+
+        elif signal.signal_type == SignalType.BEARISH_REJECTION:
+            # Bear Call Spread: Sell Call at atm_strike, Buy Call at atm_strike + chosen_width
+            sell_strike = atm_strike
+            buy_strike = sell_strike + chosen_width
+            sell_prem = 75.0
+            buy_prem = sell_prem - chosen_net_credit
+
+            legs = [
+                SpreadLeg(
+                    symbol=f"NIFTY_{int(sell_strike)}_CE",
+                    strike=sell_strike,
+                    option_type="CE",
+                    action="SELL",
+                    quantity=self.lot_size,
+                    price=sell_prem,
+                ),
+                SpreadLeg(
+                    symbol=f"NIFTY_{int(buy_strike)}_CE",
+                    strike=buy_strike,
+                    option_type="CE",
+                    action="BUY",
+                    quantity=self.lot_size,
+                    price=buy_prem,
+                ),
+            ]
+
+            max_reward_inr = round(chosen_net_credit * self.lot_size, 2)
+
+            return SpreadTrade(
+                trade_id=trade_id,
+                spread_type=SpreadType.BEAR_CALL_SPREAD,
+                legs=legs,
+                net_credit=chosen_net_credit,
+                max_risk_inr=chosen_max_risk_inr,
+                max_reward_inr=max_reward_inr,
+                timestamp=dt,
+                is_paper=self.paper_trading,
+                metadata={"signal": signal.description, "spot": spot_price, "width": chosen_width},
+            )
+
+        return None
+
+    def execute_spread(self, spread: SpreadTrade) -> bool:
+        """
+        Executes a 2-leg defined-risk spread trade:
+        1. Checks RiskGuard permission.
+        2. Routes order (paper simulation or Angel One API).
+        3. Updates RiskGuard with trade entry.
+        """
+        allowed, reason = self.risk_guard.can_enter_trade(spread.timestamp)
+        if not allowed:
+            logger.warning(f"Execution rejected by RiskGuard: {reason}")
+            return False
+
+        if self.paper_trading:
+            # Paper execution: Assign synthetic order IDs and record fill
+            for i, leg in enumerate(spread.legs):
+                leg.order_id = f"PAPER-ORD-{spread.trade_id}-{i+1}"
+            spread.status = "FILLED"
+            self.active_spread = spread
+            self.executed_trades.append(spread)
+
+            self.risk_guard.record_trade_entry(
+                trade_id=spread.trade_id,
+                details={
+                    "spread_type": spread.spread_type.value,
+                    "is_paper": True,
+                    "net_credit": spread.net_credit,
+                    "max_risk_inr": spread.max_risk_inr,
+                },
+                current_time=spread.timestamp,
+            )
+            logger.info(f"[PAPER TRADING] Executed {spread.spread_type.value} ({spread.trade_id})")
+            return True
+
+        else:
+            # Live Angel One execution
+            if not self.auth.is_authenticated or self.auth.smart_api is None:
+                raise RuntimeError("Cannot execute live trade: Angel One SmartAPI is not authenticated")
+
+            placed_orders: list[str] = []
+            try:
+                for leg in spread.legs:
+                    order_params = {
+                        "variety": "NORMAL",
+                        "tradingsymbol": leg.symbol,
+                        "symboltoken": "0",  # Replace with actual master contract token
+                        "transactiontype": leg.action,
+                        "exchange": "NFO",
+                        "ordertype": "LIMIT",
+                        "producttype": "INTRADAY",
+                        "duration": "DAY",
+                        "price": str(leg.price),
+                        "quantity": str(leg.quantity),
+                    }
+                    resp = self.auth.smart_api.placeOrder(order_params)
+                    if resp and resp.get("status"):
+                        order_id = resp["data"]["orderid"]
+                        leg.order_id = order_id
+                        placed_orders.append(order_id)
+                    else:
+                        raise RuntimeError(f"Order placement failed for {leg.symbol}: {resp}")
+
+                spread.status = "FILLED"
+                self.active_spread = spread
+                self.executed_trades.append(spread)
+
+                self.risk_guard.record_trade_entry(
+                    trade_id=spread.trade_id,
+                    details={
+                        "spread_type": spread.spread_type.value,
+                        "is_paper": False,
+                        "net_credit": spread.net_credit,
+                    },
+                    current_time=spread.timestamp,
+                )
+                return True
+
+            except Exception as e:
+                logger.error(f"Live order execution error, rolling back placed legs: {e}")
+                # Immediate atomic rollback / cancellation for safety
+                for oid in placed_orders:
+                    try:
+                        self.auth.smart_api.cancelOrder(oid, "NORMAL")
+                    except Exception:
+                        pass
+                return False
+
+    def close_active_spread(self, realized_pnl: float, exit_time: Optional[datetime] = None) -> bool:
+        """
+        Closes the active spread, records exit with RiskGuard, and clears position.
+        """
+        if self.active_spread is None:
+            return False
+
+        t_id = self.active_spread.trade_id
+        self.active_spread.status = "CLOSED"
+        self.risk_guard.record_trade_exit(t_id, realized_pnl=realized_pnl, current_time=exit_time)
+        self.active_spread = None
+        return True

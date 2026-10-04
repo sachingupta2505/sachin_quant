@@ -1,0 +1,26 @@
+# SACCHIN QUANT SYSTEM CONSTITUTION & MULTI-AGENT LIFECYCLE
+
+## 1. Core Architecture: 4 Autonomous Agents
+- AGENT 1 (Architect): Enforces trading invariants, market regimes, and contract schemas.
+- AGENT 2 (Coder): Implements pure Python logic, order models, and broker adapters.
+- AGENT 3 (Auditor): Runs automated adversarial tests, checks hard FSM constraints, and verifies trade journals.
+- AGENT 4 (DevOps & Optimizer): Manages broker session (TOTP), execution loop, and weekly offline mathematical expectancy optimization.
+
+## 2. Trading Strategy & Invariant Rules
+- Instrument: Nifty 50 Options (Strictly defined-risk credit/debit spreads).
+- Time Gating:
+  * 09:15 - 09:45 IST: Initial Balance (IBH, IBL) calculation & locking. Strictly NO trades allowed.
+  * 09:45 - 15:05 IST: Active trade window.
+  * 15:10 IST: Mandatory square-off flag.
+- Entry Logic:
+  * S/R Zone bounce with confirmed 5-min rejection candle (wick >= 50% of total candle range).
+  * Confirm regime is NOT choppy (volatility compression and rotational chop filters must pass).
+- Hard Risk Machine (Kill Switch):
+  * Max 2 trades per calendar day.
+  * Hard cumulative loss ceiling: -₹1,500. Breach immediately triggers kill-switch and exits all positions.
+  * State persisted in `daily_state.json` across crashes.
+
+## 3. Autonomous Execution & Self-Evolution Protocol
+- Mode: Paper trading by default.
+- SQLite Journal (`trading_journal.db`): Automatically logs entry timestamp, strike, expected price, executed price, slippage, MAE, and MFE.
+- Continuous Evolution: Post-market weekend runner analyzes trade logs, recalculates Sharpe & Expectancy, and tunes risk parameters inside `config.json` within hard risk guardrails.

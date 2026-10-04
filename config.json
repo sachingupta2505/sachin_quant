@@ -1,0 +1,35 @@
+{
+  "system": {
+    "version": "1.0.0",
+    "mode": "PAPER_TRADING",
+    "timezone": "Asia/Kolkata"
+  },
+  "instrument": {
+    "symbol": "NIFTY",
+    "lot_size": 25,
+    "strike_step": 50.0,
+    "spread_width_pts": 50.0,
+    "strategy": "DEFINED_RISK_CREDIT_SPREAD"
+  },
+  "time_gates": {
+    "ib_start": "09:15",
+    "ib_end": "09:45",
+    "entry_start": "09:45",
+    "entry_end": "15:05",
+    "square_off": "15:10",
+    "market_close": "15:30"
+  },
+  "risk_guardrails": {
+    "max_daily_trades": 2,
+    "hard_daily_loss_limit_inr": -1500.0,
+    "min_wick_ratio": 0.50,
+    "compression_threshold": 0.35,
+    "overlap_chop_threshold": 0.65
+  },
+  "optimizer": {
+    "target_sharpe_ratio": 2.0,
+    "target_expectancy_ratio": 1.5,
+    "min_win_rate_pct": 55.0,
+    "weekly_review_day": "SATURDAY"
+  }
+}

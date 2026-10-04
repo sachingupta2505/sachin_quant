@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Secrets & Local Config
+.env
+*.pem
+*.key
+
+# Runtime DBs and logs
+logs/
+*.log
+*.db
+*.db-wal
+*.db-shm
+algo_engine.log
+daily_state.json
+
+# Node
+node_modules/

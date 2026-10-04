@@ -1,0 +1,23 @@
+[Unit]
+Description=Nifty Derivatives Algorithmic Trading Engine
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nifty-trading-engine
+EnvironmentFile=/home/ubuntu/nifty-trading-engine/.env
+ExecStart=/home/ubuntu/nifty-trading-engine/venv/bin/python main.py
+Restart=always
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+
+# Hardening & Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nifty-engine
+
+[Install]
+WantedBy=multi-user.target
