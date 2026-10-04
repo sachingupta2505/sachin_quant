@@ -188,3 +188,87 @@ def test_overseer_detects_excessive_spread_ratio(tmp_path: Path):
     res = auditor.audit_devops_bid_ask_spread_guard()
     assert res.passed is False
     assert "must be <= 0.10" in res.message
+
+
+def test_overseer_cli_next_command_returns_actionable_prompt():
+    """
+    Verifies that running `python agents/overseer.py --next` exits with code 0
+    and returns an actionable development prompt for the next roadmap milestone.
+    """
+    repo_root = Path(__file__).parent.parent
+    proc = subprocess.run(
+        [sys.executable, "agents/overseer.py", "--next"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0
+    stdout = proc.stdout
+    assert "AUTONOMOUS TASK GENERATOR: NEXT DEVELOPMENT ROADMAP TASK" in stdout
+    assert "ALL SYSTEM INVARIANTS SATISFIED [PASS]" in stdout
+    assert "[X] Milestone 1: End-to-end integration test" in stdout
+    assert "[ ] Milestone 2: Paper trading replay engine with historical 1-minute tick data" in stdout
+    assert "READY-TO-RUN PROMPT FOR NEXT MILESTONE (Milestone 2):" in stdout
+    assert "replay_engine.py" in stdout
+    assert "ReplayEngine" in stdout
+
+
+def test_overseer_cli_next_command_emits_prioritized_remediation_on_failure(tmp_path: Path):
+    """
+    Verifies that when any invariant fails, generate_next_task returns exit code 1
+    and prints a prioritized remediation prompt specifying the exact file and lines to fix.
+    """
+    fake_agents = tmp_path / "agents"
+    fake_agents.mkdir(parents=True)
+    fake_coder = fake_agents / "coder.py"
+    fake_coder.write_text(
+        "# Header\n# Comment\nMAX_PERMITTED_SPREAD_RISK_INR = 3500.0\n",
+        encoding="utf-8",
+    )
+
+    auditor = StaticInvariantAuditor(root_dir=tmp_path)
+    prompt, code = auditor.generate_next_task()
+
+    assert code == 1
+    assert "OVERSEER AGENT: INVARIANT AUDIT FAILED - REMEDIATION REQUIRED" in prompt
+    assert "PRIORITIZED REMEDIATION PROMPT:" in prompt
+    assert "Target File:" in prompt
+    assert str(fake_coder) in prompt or "coder.py" in prompt
+    assert "Line 3" in prompt  # Exact line number verified!
+    assert "exceeds maximum ceiling of 1500.0 INR" in prompt
+
+
+def test_overseer_milestone_evaluation_progression(tmp_path: Path):
+    """
+    Verifies evaluation of milestones 1, 2, and 3 based on codebase files.
+    """
+    auditor = StaticInvariantAuditor(root_dir=tmp_path)
+    milestones = auditor.evaluate_roadmap_milestones()
+    assert len(milestones) == 3
+    assert milestones[0].completed is False  # No integration test yet in tmp_path
+
+    # Complete Milestone 1 in tmp_path
+    m1_file = tmp_path / "test_blackboard_integration.py"
+    m1_file.write_text(
+        "from bus import SystemBus\ndef test_blackboard_end_to_end_flow(): pass\n",
+        encoding="utf-8",
+    )
+    milestones = auditor.evaluate_roadmap_milestones()
+    assert milestones[0].completed is True
+    assert milestones[1].completed is False
+
+    next_m = auditor.get_next_uncompleted_milestone()
+    assert next_m is not None
+    assert next_m.id == 2
+
+    # Complete Milestone 2 in tmp_path
+    m2_file = tmp_path / "replay_engine.py"
+    m2_file.write_text("class ReplayEngine: pass\n", encoding="utf-8")
+    milestones = auditor.evaluate_roadmap_milestones()
+    assert milestones[1].completed is True
+    assert milestones[2].completed is False
+
+    next_m = auditor.get_next_uncompleted_milestone()
+    assert next_m is not None
+    assert next_m.id == 3
