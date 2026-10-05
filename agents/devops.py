@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 from agents.base import AgentMessage, BaseAgent, MessageType
 from execution_engine import AngelAuth
+from nfo_token_resolver import NFOTokenResolver
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -63,12 +64,14 @@ class DevOpsAgent(BaseAgent):
         paper_trading: bool = True,
         order_type: str = DEFAULT_ORDER_TYPE,
         tz: ZoneInfo = IST,
+        token_resolver: Optional[NFOTokenResolver] = None,
     ):
         super().__init__(name="DevOps")
         self.dispatch_fn = dispatch_fn
         self.paper_trading = paper_trading
         self.order_type = order_type
         self.tz = tz
+        self.token_resolver = token_resolver or NFOTokenResolver()
 
         # Initialize Angel One credentials from environment
         self.auth = AngelAuth(
@@ -111,6 +114,70 @@ class DevOpsAgent(BaseAgent):
         elif message.msg_type == MessageType.SQUARE_OFF_ALERT:
             self.liquidate_position(message.payload)
 
+    def _execute_paper_order(self, legs: list[dict], trade_id: str) -> list[dict]:
+        """Simulates paper execution with dynamically resolved trading symbols and tokens."""
+        executed_legs = []
+        for i, leg in enumerate(legs):
+            strike = float(leg.get("strike", 25000.0))
+            opt_type = leg.get("option_type", "CE")
+            expiry_date = leg.get("expiry_date")
+            tradingsymbol, symboltoken = self.token_resolver.resolve_token(
+                symbol="NIFTY",
+                strike=strike,
+                option_type=opt_type,
+                expiry_date=expiry_date,
+            )
+            order_id = f"PAPER-ORD-{trade_id}-{i+1}"
+            executed_legs.append({
+                **leg,
+                "tradingsymbol": tradingsymbol,
+                "symboltoken": symboltoken,
+                "order_id": order_id,
+                "status": "FILLED",
+            })
+        return executed_legs
+
+    def _place_broker_order(self, legs: list[dict]) -> tuple[list[str], list[dict]]:
+        """Executes live orders via Angel One SmartAPI with dynamic symbol and token resolution."""
+        placed_ids = []
+        executed_legs = []
+        for leg in legs:
+            strike = float(leg.get("strike", 25000.0))
+            opt_type = leg.get("option_type", "CE")
+            expiry_date = leg.get("expiry_date")
+            tradingsymbol, symboltoken = self.token_resolver.resolve_token(
+                symbol="NIFTY",
+                strike=strike,
+                option_type=opt_type,
+                expiry_date=expiry_date,
+            )
+            order_params = {
+                "variety": "NORMAL",
+                "tradingsymbol": tradingsymbol,
+                "symboltoken": symboltoken,
+                "transactiontype": leg["action"],
+                "exchange": "NFO",
+                "ordertype": "LIMIT",
+                "producttype": "INTRADAY",
+                "duration": "DAY",
+                "price": str(leg["price"]),
+                "quantity": str(leg["quantity"]),
+            }
+            resp = self.auth.smart_api.placeOrder(order_params)
+            if resp and resp.get("status"):
+                oid = resp["data"]["orderid"]
+                placed_ids.append(oid)
+                executed_legs.append({
+                    **leg,
+                    "tradingsymbol": tradingsymbol,
+                    "symboltoken": symboltoken,
+                    "order_id": oid,
+                    "status": "FILLED",
+                })
+            else:
+                raise RuntimeError(f"Order failed on {tradingsymbol} ({symboltoken}): {resp}")
+        return placed_ids, executed_legs
+
     def dispatch_order(self, payload: dict) -> None:
         trade_id = payload["trade_id"]
         legs = payload["legs"]
@@ -137,11 +204,7 @@ class DevOpsAgent(BaseAgent):
 
         executed_legs = []
         if self.paper_trading:
-            # Paper execution simulation with minor realistic tick slippage
-            for i, leg in enumerate(legs):
-                order_id = f"PAPER-ORD-{trade_id}-{i+1}"
-                executed_legs.append({**leg, "order_id": order_id, "status": "FILLED"})
-
+            executed_legs = self._execute_paper_order(legs, trade_id)
             self.active_order = payload
             self.logger.info(
                 f"[DevOps Fill Confirmed] All {len(executed_legs)} legs filled synthetically. "
@@ -175,27 +238,7 @@ class DevOpsAgent(BaseAgent):
 
             placed_ids = []
             try:
-                for leg in legs:
-                    order_params = {
-                        "variety": "NORMAL",
-                        "tradingsymbol": leg["symbol"],
-                        "symboltoken": "0",
-                        "transactiontype": leg["action"],
-                        "exchange": "NFO",
-                        "ordertype": "LIMIT",
-                        "producttype": "INTRADAY",
-                        "duration": "DAY",
-                        "price": str(leg["price"]),
-                        "quantity": str(leg["quantity"]),
-                    }
-                    resp = self.auth.smart_api.placeOrder(order_params)
-                    if resp and resp.get("status"):
-                        oid = resp["data"]["orderid"]
-                        placed_ids.append(oid)
-                        executed_legs.append({**leg, "order_id": oid, "status": "FILLED"})
-                    else:
-                        raise RuntimeError(f"Order failed on {leg['symbol']}: {resp}")
-
+                placed_ids, executed_legs = self._place_broker_order(legs)
                 self.active_order = payload
                 if self.dispatch_fn:
                     conf = AgentMessage(

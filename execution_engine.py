@@ -24,6 +24,7 @@ from SmartApi import SmartConnect
 
 from regime_filter import Candle, InitialBalance
 from risk_guard import RiskGuard, RiskState
+from nfo_token_resolver import NFOTokenResolver
 
 logger = logging.getLogger("execution_engine")
 IST = ZoneInfo("Asia/Kolkata")
@@ -457,6 +458,7 @@ class ExecutionEngine:
         lot_size: int = NIFTY_LOT_SIZE,
         spread_width_pts: float = 50.0,
         tz: ZoneInfo = IST,
+        token_resolver: Optional[NFOTokenResolver] = None,
     ):
         self.risk_guard = risk_guard
         self.auth = auth or AngelAuth()
@@ -464,6 +466,7 @@ class ExecutionEngine:
         self.lot_size = lot_size
         self.spread_width_pts = spread_width_pts
         self.tz = tz
+        self.token_resolver = token_resolver or NFOTokenResolver()
         self.active_spread: Optional[SpreadTrade] = None
         self.executed_trades: list[SpreadTrade] = []
 
@@ -648,10 +651,15 @@ class ExecutionEngine:
             placed_orders: list[str] = []
             try:
                 for leg in spread.legs:
+                    resolved_sym, resolved_tok = self.token_resolver.resolve_token(
+                        symbol="NIFTY",
+                        strike=leg.strike,
+                        option_type=leg.option_type,
+                    )
                     order_params = {
                         "variety": "NORMAL",
-                        "tradingsymbol": leg.symbol,
-                        "symboltoken": "0",  # Replace with actual master contract token
+                        "tradingsymbol": resolved_sym,
+                        "symboltoken": resolved_tok,
                         "transactiontype": leg.action,
                         "exchange": "NFO",
                         "ordertype": "LIMIT",

@@ -47,6 +47,7 @@ from risk_guard import RiskGuard
 from audit_logger import AuditLogger
 from agents.architect import EXPIRY_CUTOFF_TIME, is_expiry_day
 from agents.notifier import TelegramNotifier, notifier_worker
+from nfo_token_resolver import NFOTokenResolver
 
 IST = ZoneInfo("Asia/Kolkata")
 LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "25"))
@@ -418,13 +419,15 @@ def devops_worker(
     stop_event: threading.Event,
     verified_events: Optional[dict[str, threading.Event]] = None,
     paper_trading: bool = True,
+    token_resolver: Optional[NFOTokenResolver] = None,
 ) -> None:
     """
     DevOps Agent Worker:
     Consumes ORDER_APPROVED events from Blackboard.
     Validates LIMIT order type & bid-ask liquidity spread guard.
-    Fills order in Paper Trading mode (default) and publishes ORDER_EXECUTED to Auditor.
+    Fills order with dynamic token resolution and publishes ORDER_EXECUTED to Auditor.
     """
+    resolver = token_resolver or NFOTokenResolver()
     while not stop_event.is_set():
         events = bus.consume(topic="ORDER_APPROVED", target="DevOps")
         for ev in events:
@@ -448,7 +451,22 @@ def devops_worker(
 
             executed_legs = []
             for i, leg in enumerate(legs):
-                executed_legs.append({**leg, "order_id": f"FILL-{trade_id}-{i+1}", "status": "FILLED"})
+                strike = float(leg.get("strike", 25000.0))
+                opt_type = leg.get("option_type", "CE")
+                expiry_date = leg.get("expiry_date")
+                tradingsymbol, symboltoken = resolver.resolve_token(
+                    symbol="NIFTY",
+                    strike=strike,
+                    option_type=opt_type,
+                    expiry_date=expiry_date,
+                )
+                executed_legs.append({
+                    **leg,
+                    "tradingsymbol": tradingsymbol,
+                    "symboltoken": symboltoken,
+                    "order_id": f"FILL-{trade_id}-{i+1}",
+                    "status": "FILLED",
+                })
 
             eid = bus.publish(
                 topic="ORDER_EXECUTED",
