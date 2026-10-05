@@ -167,12 +167,13 @@ class SystemBus:
 
         return events
 
-    def update_status(self, event_id: int, new_status: EventStatus) -> None:
+    def update_status(self, event_id: int, new_status: EventStatus | str) -> None:
         """Updates the lifecycle status of an event."""
+        status_val = new_status.value if hasattr(new_status, "value") else str(new_status)
         with self._get_connection() as conn:
             conn.execute(
                 "UPDATE bus_events SET status = ? WHERE id = ?",
-                (new_status.value, event_id),
+                (status_val, event_id),
             )
             conn.commit()
 

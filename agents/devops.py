@@ -263,7 +263,11 @@ class DevOpsAgent(BaseAgent):
         if not resp_buy or not resp_buy.get("status"):
             raise RuntimeError(f"BUY hedge leg failed on {sym_buy}: {resp_buy}")
 
-        buy_oid = resp_buy["data"]["orderid"]
+        data_buy = resp_buy.get("data") if isinstance(resp_buy, dict) else None
+        buy_oid = data_buy.get("orderid") if isinstance(data_buy, dict) else None
+        if not buy_oid:
+            raise RuntimeError(f"BUY hedge leg returned no orderid: {resp_buy}")
+
         placed_ids.append(buy_oid)
         executed_legs.append({
             **buy,
@@ -297,8 +301,10 @@ class DevOpsAgent(BaseAgent):
             "quantity": str(sell["quantity"]),
         }
         resp_sell = self.auth.smart_api.placeOrder(params_sell)
-        if not resp_sell or not resp_sell.get("status"):
-            # If placing SELL leg failed immediately, square off BUY leg
+        data_sell = resp_sell.get("data") if isinstance(resp_sell, dict) else None
+        sell_oid = data_sell.get("orderid") if isinstance(data_sell, dict) else None
+        if not resp_sell or not resp_sell.get("status") or not sell_oid:
+            # If placing SELL leg failed immediately or returned no orderid, square off BUY leg
             sq_params = {
                 "variety": "NORMAL",
                 "tradingsymbol": sym_buy,
@@ -317,7 +323,6 @@ class DevOpsAgent(BaseAgent):
                 pass
             raise RuntimeError(f"SELL short leg order placement failed: {resp_sell}")
 
-        sell_oid = resp_sell["data"]["orderid"]
         placed_ids.append(sell_oid)
 
         # 2-Leg Incomplete Fill Guard: Monitor Leg 2 fill for up to 5.0 seconds

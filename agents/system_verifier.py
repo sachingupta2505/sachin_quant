@@ -21,6 +21,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+repo_root = Path(__file__).resolve().parent.parent
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
 # Fix Windows console UTF-8 output
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
@@ -479,6 +483,12 @@ class SystemVerifier:
         print("=" * 125 + "\n")
         return all_passed
 
+    def run_red_team_audit(self) -> dict:
+        """Invokes Autonomous Red-Team Independent Analyst as final mandatory gatekeeper."""
+        from agents.independent_analyst import IndependentAnalyst
+        analyst = IndependentAnalyst(root_dir=self.root_dir)
+        return analyst.audit_and_heal()
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -490,7 +500,16 @@ def main():
     checks = verifier.run_all_diagnostics()
     ready = verifier.print_readiness_matrix(checks)
 
-    sys.exit(0 if ready else 1)
+    if not ready:
+        sys.exit(1)
+
+    # Final Mandatory Gatekeeper: Autonomous Red-Team Independent Analyst
+    analyst_report = verifier.run_red_team_audit()
+    if analyst_report["vulnerability_score"] > 0 or analyst_report["status"] != "PASS" or analyst_report["unhealed_defects"] > 0:
+        print(f"\n[CRITICAL RED-TEAM ABORT] IndependentAnalyst discovered {analyst_report['unhealed_defects']} open vulnerabilities! Pre-flight aborted.")
+        sys.exit(1)
+
+    sys.exit(0)
 
 
 if __name__ == "__main__":
