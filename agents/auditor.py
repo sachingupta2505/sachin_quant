@@ -241,23 +241,29 @@ class AuditorAgent(BaseAgent):
     def on_position_closed(self, payload: dict) -> None:
         """Records exit in RiskGuard and completes SQLite journal entry."""
         trade_id = payload["trade_id"]
-        realized_pnl = float(payload["realized_pnl"])
+        realized_pnl = float(payload.get("realized_pnl", 0.0))
+        gross_pnl = float(payload.get("gross_pnl", realized_pnl))
+        total_charges = float(payload.get("total_charges", 0.0))
+        net_pnl = float(payload.get("net_pnl", round(gross_pnl - total_charges, 2)))
         expected_exit = float(payload.get("expected_exit_price", 0.0))
         actual_exit = float(payload.get("actual_exit_price", 0.0))
         ts = payload.get("timestamp") or datetime.now(self.tz)
 
-        self.risk_guard.record_trade_exit(trade_id, realized_pnl=realized_pnl, current_time=ts)
+        self.risk_guard.record_trade_exit(trade_id, realized_pnl=net_pnl, current_time=ts)
 
         closed = self.audit_logger.log_trade_exit(
             trade_id=trade_id,
             expected_exit_price=expected_exit,
             actual_exit_price=actual_exit,
-            realized_pnl=realized_pnl,
+            realized_pnl=net_pnl,
             timestamp=ts,
             notes=payload.get("exit_reason", ""),
+            gross_pnl=gross_pnl,
+            total_charges=total_charges,
+            net_pnl=net_pnl,
         )
 
         self.logger.info(
-            f"[TRADE CLOSED] {trade_id} | Realized PnL: INR {realized_pnl:.2f} | "
+            f"[TRADE CLOSED] {trade_id} | Net PnL: INR {net_pnl:.2f} (Gross: {gross_pnl:.2f}, Charges: {total_charges:.2f}) | "
             f"MAE: INR {closed.mae_inr:.2f} | MFE: INR {closed.mfe_inr:.2f} | Total Slippage: {closed.total_slippage}"
         )

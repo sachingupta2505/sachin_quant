@@ -150,15 +150,41 @@ def load_trades_data(
     df["strategy_display"] = df["spread_type"].apply(
         lambda s: str(s).replace("_", " ").title() if s else "Spread"
     )
+    if "gross_pnl" not in df.columns:
+        df["gross_pnl"] = df["realized_pnl"]
+    if "total_charges" not in df.columns:
+        df["total_charges"] = 0.0
+    if "net_pnl" not in df.columns:
+        df["net_pnl"] = df["realized_pnl"]
 
     return df
 
 
-def compute_kpis(df: pd.DataFrame) -> Dict[str, Any]:
-    """Computes headline KPIs from trade journal."""
+def get_starting_capital(config_path: Path = ROOT_DIR / "config.json") -> float:
+    """Reads starting capital from config.json, defaulting to ₹1,00,000.00."""
+    if config_path.exists():
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            if "starting_capital" in data:
+                return float(data["starting_capital"])
+            if "capital" in data and "starting_capital" in data["capital"]:
+                return float(data["capital"]["starting_capital"])
+        except Exception:
+            pass
+    return 100000.0
+
+
+def compute_kpis(df: pd.DataFrame, starting_capital: Optional[float] = None) -> Dict[str, Any]:
+    """Computes headline KPIs from trade journal including base capital and regulatory charges."""
+    cap = starting_capital if starting_capital is not None else get_starting_capital()
     if df.empty:
         return {
+            "starting_capital": cap,
+            "current_balance": cap,
+            "gross_pnl": 0.0,
+            "total_charges": 0.0,
             "net_pnl": 0.0,
+            "net_roi_pct": 0.0,
             "win_rate": 0.0,
             "total_trades": 0,
             "closed_trades": 0,
@@ -168,19 +194,30 @@ def compute_kpis(df: pd.DataFrame) -> Dict[str, Any]:
             "is_paper": True,
         }
 
-    net_pnl = float(df["realized_pnl"].sum())
+    gross_pnl = float(df["gross_pnl"].sum()) if "gross_pnl" in df.columns else float(df["realized_pnl"].sum())
+    total_charges = float(df["total_charges"].sum()) if "total_charges" in df.columns else 0.0
+    net_pnl = float(df["net_pnl"].sum()) if "net_pnl" in df.columns else float(df["realized_pnl"].sum())
+    current_balance = round(cap + net_pnl, 2)
+    net_roi_pct = round((net_pnl / cap) * 100.0, 2) if cap > 0 else 0.0
+
     total_trades = len(df)
     closed = df[df["status"] == "CLOSED"]
     closed_trades = len(closed)
-    winning_trades = int((closed["realized_pnl"] > 0).sum())
-    losing_trades = int((closed["realized_pnl"] < 0).sum())
+    pnl_series = closed["net_pnl"] if "net_pnl" in closed.columns else closed["realized_pnl"]
+    winning_trades = int((pnl_series > 0).sum())
+    losing_trades = int((pnl_series < 0).sum())
     win_rate = (winning_trades / closed_trades * 100.0) if closed_trades > 0 else 0.0
 
     # Mode: Live Money if any trade has is_paper == 0, else Paper Trading
     is_paper = bool((df["is_paper"] != 0).all()) if "is_paper" in df.columns else True
 
     return {
+        "starting_capital": cap,
+        "current_balance": current_balance,
+        "gross_pnl": gross_pnl,
+        "total_charges": total_charges,
         "net_pnl": net_pnl,
+        "net_roi_pct": net_roi_pct,
         "win_rate": round(win_rate, 1),
         "total_trades": total_trades,
         "closed_trades": closed_trades,
@@ -318,16 +355,20 @@ def render_ui(
     pnl_icon = "🟢" if net_pnl >= 0 else "🔴"
 
     with kpi_col1:
+        bal = kpis["current_balance"]
+        bal_color = "#16a34a" if bal >= kpis["starting_capital"] else "#dc2626"
         st.markdown(
             f"""
             <div class='kpi-card'>
                 <div style='font-size: 13px; color: #64748b; font-weight: 600; text-transform: uppercase;'>
-                    {pnl_icon} Net Profit / Loss
+                    💼 Capital vs Balance
                 </div>
-                <div style='font-size: 32px; font-weight: 800; color: {pnl_color}; margin-top: 6px;'>
-                    {pnl_sign}₹{abs(net_pnl):,.2f}
+                <div style='font-size: 30px; font-weight: 800; color: {bal_color}; margin-top: 6px;'>
+                    ₹{bal:,.2f}
                 </div>
-                <div style='font-size: 12px; color: #94a3b8; margin-top: 4px;'>Realized Daily PnL</div>
+                <div style='font-size: 12px; color: #94a3b8; margin-top: 4px;'>
+                    Starting Capital: ₹{kpis['starting_capital']:,.2f}
+                </div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -338,13 +379,13 @@ def render_ui(
             f"""
             <div class='kpi-card'>
                 <div style='font-size: 13px; color: #64748b; font-weight: 600; text-transform: uppercase;'>
-                    🎯 Win Rate
+                    {pnl_icon} Net Realized PnL
                 </div>
-                <div style='font-size: 32px; font-weight: 800; color: #0f172a; margin-top: 6px;'>
-                    {kpis['win_rate']:.1f}%
+                <div style='font-size: 30px; font-weight: 800; color: {pnl_color}; margin-top: 6px;'>
+                    {pnl_sign}₹{abs(net_pnl):,.2f}
                 </div>
                 <div style='font-size: 12px; color: #94a3b8; margin-top: 4px;'>
-                    {kpis['winning_trades']}W / {kpis['losing_trades']}L ({kpis['closed_trades']} Closed)
+                    After Taxes & Charges (Gross: ₹{kpis['gross_pnl']:,.2f})
                 </div>
             </div>
             """,
@@ -356,28 +397,35 @@ def render_ui(
             f"""
             <div class='kpi-card'>
                 <div style='font-size: 13px; color: #64748b; font-weight: 600; text-transform: uppercase;'>
-                    🔢 Total Trades Today
+                    🧾 Total Charges Deducted
                 </div>
-                <div style='font-size: 32px; font-weight: 800; color: #0f172a; margin-top: 6px;'>
-                    {kpis['total_trades']}
+                <div style='font-size: 30px; font-weight: 800; color: #e11d48; margin-top: 6px;'>
+                    ₹{kpis['total_charges']:,.2f}
                 </div>
-                <div style='font-size: 12px; color: #94a3b8; margin-top: 4px;'>Hard Cap: 2 Trades / Day</div>
+                <div style='font-size: 12px; color: #94a3b8; margin-top: 4px;'>
+                    STT, ETC, GST, Stamp & Brokerage
+                </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
     with kpi_col4:
+        roi = kpis["net_roi_pct"]
+        roi_color = "#16a34a" if roi >= 0 else "#dc2626"
+        roi_sign = "+" if roi > 0 else ("" if roi == 0 else "-")
         st.markdown(
             f"""
             <div class='kpi-card'>
                 <div style='font-size: 13px; color: #64748b; font-weight: 600; text-transform: uppercase;'>
-                    🛡️ Max Risk Per Trade
+                    🎯 Net ROI %
                 </div>
-                <div style='font-size: 32px; font-weight: 800; color: #0f172a; margin-top: 6px;'>
-                    ₹{kpis['max_risk_cap']:,.0f}
+                <div style='font-size: 30px; font-weight: 800; color: {roi_color}; margin-top: 6px;'>
+                    {roi_sign}{abs(roi):.2f}%
                 </div>
-                <div style='font-size: 12px; color: #94a3b8; margin-top: 4px;'>Risk Guard Ceiling: ₹1,500</div>
+                <div style='font-size: 12px; color: #94a3b8; margin-top: 4px;'>
+                    Win Rate: {kpis['win_rate']:.1f}% ({kpis['winning_trades']}W / {kpis['losing_trades']}L)
+                </div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -385,26 +433,27 @@ def render_ui(
 
     st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
 
-    # Middle Row: Simple Profit Chart
+    # Middle Row: Simple Profit Chart (NET PnL Curve)
     st.markdown(
-        "<h3 style='color: #1e293b; font-weight: 700; margin-bottom: 8px;'>📈 Cumulative Performance</h3>",
+        "<h3 style='color: #1e293b; font-weight: 700; margin-bottom: 8px;'>📈 Cumulative Performance (Net PnL)</h3>",
         unsafe_allow_html=True,
     )
 
     if df.empty:
         st.info("ℹ️ No trades executed yet today. Market session is being monitored.")
     else:
-        # Build chronological cumsum
+        # Build chronological cumsum of Net PnL
         df_sorted = df.sort_values(by="entry_time", ascending=True).copy()
-        df_sorted["cum_pnl"] = df_sorted["realized_pnl"].cumsum()
+        pnl_col = "net_pnl" if "net_pnl" in df_sorted.columns else "realized_pnl"
+        df_sorted["cum_net_pnl"] = df_sorted[pnl_col].cumsum()
 
         # Add initial zero point
-        chart_records = [{"Trade #": "Open", "Cumulative PnL (₹)": 0.0}]
+        chart_records = [{"Trade #": "Open", "Net Cumulative PnL (₹)": 0.0}]
         for idx, row in enumerate(df_sorted.itertuples(), start=1):
             t_label = f"#{idx} ({getattr(row, 'time_display', '')})"
             chart_records.append({
                 "Trade #": t_label,
-                "Cumulative PnL (₹)": float(row.cum_pnl),
+                "Net Cumulative PnL (₹)": float(getattr(row, "cum_net_pnl", 0.0)),
             })
 
         chart_df = pd.DataFrame(chart_records)
@@ -419,8 +468,8 @@ def render_ui(
             )
             .encode(
                 x=alt.X("Trade #:N", title="Trade Sequence", sort=None),
-                y=alt.Y("Cumulative PnL (₹):Q", title="Cumulative PnL (₹)"),
-                tooltip=["Trade #:N", "Cumulative PnL (₹):Q"],
+                y=alt.Y("Net Cumulative PnL (₹):Q", title="Net Cumulative PnL (₹)"),
+                tooltip=["Trade #:N", "Net Cumulative PnL (₹):Q"],
             )
             .properties(height=260)
             .configure_axis(grid=True, gridColor="#f1f5f9")
@@ -430,7 +479,7 @@ def render_ui(
 
     st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
 
-    # Bottom Row: Friendly Trade Log Table
+    # Bottom Row: Friendly Trade Log Table displaying Gross ₹, Charges ₹, Net ₹
     st.markdown(
         "<h3 style='color: #1e293b; font-weight: 700; margin-bottom: 8px;'>📋 Live Trade Log</h3>",
         unsafe_allow_html=True,
@@ -448,14 +497,18 @@ def render_ui(
         table_df["Exit ₹"] = df["actual_exit_price"].apply(
             lambda v: f"₹{float(v):.2f}" if pd.notnull(v) and float(v) > 0 else "-"
         )
-        table_df["Profit/Loss (₹)"] = df["realized_pnl"].apply(
+        table_df["Gross ₹"] = df["gross_pnl"].apply(
+            lambda v: f"+₹{float(v):,.2f}" if float(v) > 0 else (f"-₹{abs(float(v)):,.2f}" if float(v) < 0 else "₹0.00")
+        )
+        table_df["Charges ₹"] = df["total_charges"].apply(lambda v: f"₹{float(v):,.2f}")
+        table_df["Net ₹"] = df["net_pnl"].apply(
             lambda v: f"+₹{float(v):,.2f}" if float(v) > 0 else (f"-₹{abs(float(v)):,.2f}" if float(v) < 0 else "₹0.00")
         )
         table_df["Status"] = df["status"]
 
-        # Color-coded styled table
+        # Color-coded styled table based on Net PnL
         def highlight_pnl(row: pd.Series) -> list[str]:
-            pnl_str = str(row["Profit/Loss (₹)"])
+            pnl_str = str(row["Net ₹"])
             if pnl_str.startswith("+"):
                 # Soft green highlight
                 return ["background-color: rgba(34, 197, 94, 0.12)"] * len(row)

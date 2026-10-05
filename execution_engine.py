@@ -26,6 +26,7 @@ from SmartApi import SmartConnect
 from regime_filter import Candle, InitialBalance
 from risk_guard import RiskGuard, RiskState
 from nfo_token_resolver import NFOTokenResolver
+from fee_calculator import IndianRegulatoryFeeCalculator
 
 logger = logging.getLogger("execution_engine")
 IST = ZoneInfo("Asia/Kolkata")
@@ -95,6 +96,9 @@ class SpreadTrade:
     timestamp: datetime
     is_paper: bool = True
     status: str = "OPEN"
+    gross_pnl: float = 0.0
+    total_charges: float = 0.0
+    net_pnl: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -798,15 +802,51 @@ class ExecutionEngine:
             time.sleep(0.5)
         return False
 
-    def close_active_spread(self, realized_pnl: float, exit_time: Optional[datetime] = None) -> bool:
+    def close_active_spread(
+        self,
+        realized_pnl: float,
+        exit_time: Optional[datetime] = None,
+        gross_pnl: Optional[float] = None,
+        total_charges: Optional[float] = None,
+        net_pnl: Optional[float] = None,
+    ) -> bool:
         """
         Closes the active spread, records exit with RiskGuard, and clears position.
+        Calculates exact Indian regulatory charges if not provided.
         """
         if self.active_spread is None:
             return False
 
         t_id = self.active_spread.trade_id
         self.active_spread.status = "CLOSED"
-        self.risk_guard.record_trade_exit(t_id, realized_pnl=realized_pnl, current_time=exit_time)
+
+        # Calculate charges if not provided
+        if total_charges is None:
+            try:
+                fee_calc = IndianRegulatoryFeeCalculator()
+                buy_leg = next((leg for leg in self.active_spread.legs if leg.action == "BUY"), None)
+                sell_leg = next((leg for leg in self.active_spread.legs if leg.action == "SELL"), None)
+                buy_prem = buy_leg.price if buy_leg else 0.0
+                sell_prem = sell_leg.price if sell_leg else 0.0
+                qty = buy_leg.quantity if buy_leg else (sell_leg.quantity if sell_leg else NIFTY_LOT_SIZE)
+                total_charges = fee_calc.calculate_charges(buy_prem, sell_prem, qty, num_legs=len(self.active_spread.legs))
+            except Exception:
+                total_charges = 0.0
+
+        if net_pnl is not None:
+            if gross_pnl is None:
+                gross_pnl = round(net_pnl + total_charges, 2)
+        elif gross_pnl is not None:
+            net_pnl = round(gross_pnl - total_charges, 2)
+        else:
+            # Direct realized_pnl passed: treat as net PnL for backward compatibility
+            net_pnl = realized_pnl
+            gross_pnl = round(net_pnl + total_charges, 2)
+
+        self.active_spread.gross_pnl = gross_pnl
+        self.active_spread.total_charges = total_charges
+        self.active_spread.net_pnl = net_pnl
+
+        self.risk_guard.record_trade_exit(t_id, realized_pnl=net_pnl, current_time=exit_time)
         self.active_spread = None
         return True

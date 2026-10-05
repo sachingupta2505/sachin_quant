@@ -11,10 +11,11 @@ Implements an ACID SQLite trade journal tracking:
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -35,7 +36,10 @@ class TradeAuditEntry:
     actual_exit_price: Optional[float] = None
     exit_slippage: float = 0.0
     total_slippage: float = 0.0
-    realized_pnl: float = 0.0
+    realized_pnl: float = 0.0  # Net realized PnL
+    gross_pnl: float = 0.0     # Gross raw points * quantity
+    total_charges: float = 0.0 # Total regulatory fees + brokerage
+    net_pnl: float = 0.0       # gross_pnl - total_charges
     mae_inr: float = 0.0  # Maximum Adverse Excursion (deepest negative point during trade)
     mfe_inr: float = 0.0  # Maximum Favorable Excursion (highest positive point during trade)
     is_paper: bool = True
@@ -55,10 +59,14 @@ class AuditLogger:
         self._live_trackers: dict[str, dict[str, float]] = {}
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def _get_connection(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +88,9 @@ class AuditLogger:
                     exit_slippage REAL DEFAULT 0.0,
                     total_slippage REAL DEFAULT 0.0,
                     realized_pnl REAL DEFAULT 0.0,
+                    gross_pnl REAL DEFAULT 0.0,
+                    total_charges REAL DEFAULT 0.0,
+                    net_pnl REAL DEFAULT 0.0,
                     mae_inr REAL DEFAULT 0.0,
                     mfe_inr REAL DEFAULT 0.0,
                     is_paper INTEGER NOT NULL,
@@ -88,6 +99,12 @@ class AuditLogger:
                 );
                 """
             )
+            # Schema migration for existing databases missing new columns
+            existing_cols = {col[1] for col in conn.execute("PRAGMA table_info(trade_journal)").fetchall()}
+            for col_name in ("gross_pnl", "total_charges", "net_pnl"):
+                if col_name not in existing_cols:
+                    conn.execute(f"ALTER TABLE trade_journal ADD COLUMN {col_name} REAL DEFAULT 0.0;")
+
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS execution_events (
@@ -195,9 +212,12 @@ class AuditLogger:
         trade_id: str,
         expected_exit_price: float,
         actual_exit_price: float,
-        realized_pnl: float,
+        realized_pnl: float = 0.0,
         timestamp: Optional[datetime] = None,
         notes: str = "",
+        gross_pnl: Optional[float] = None,
+        total_charges: Optional[float] = None,
+        net_pnl: Optional[float] = None,
     ) -> TradeAuditEntry:
         """
         Logs trade exit, calculates exit slippage, closes live MAE/MFE tracking,
@@ -205,6 +225,15 @@ class AuditLogger:
         """
         now = timestamp or datetime.now(self.tz)
         now_iso = now.isoformat()
+
+        # Compute Gross, Charges, and Net PnL
+        if gross_pnl is None:
+            gross_pnl = realized_pnl
+        if total_charges is None:
+            total_charges = 0.0
+        if net_pnl is None:
+            net_pnl = round(gross_pnl - total_charges, 2)
+        realized_pnl = net_pnl
 
         # Exit slippage
         exit_slippage = round(actual_exit_price - expected_exit_price, 4)
@@ -233,6 +262,9 @@ class AuditLogger:
                     exit_slippage = ?,
                     total_slippage = ?,
                     realized_pnl = ?,
+                    gross_pnl = ?,
+                    total_charges = ?,
+                    net_pnl = ?,
                     mae_inr = ?,
                     mfe_inr = ?,
                     status = 'CLOSED',
@@ -246,6 +278,9 @@ class AuditLogger:
                     exit_slippage,
                     total_slippage,
                     realized_pnl,
+                    gross_pnl,
+                    total_charges,
+                    net_pnl,
                     mae,
                     mfe,
                     notes,
@@ -261,7 +296,7 @@ class AuditLogger:
                 (
                     trade_id,
                     now_iso,
-                    f"Closed with PnL {realized_pnl:.2f}, MAE {mae:.2f}, MFE {mfe:.2f}, total slippage {total_slippage}",
+                    f"Closed with Net PnL {net_pnl:.2f} (Gross {gross_pnl:.2f}, Charges {total_charges:.2f}), MAE {mae:.2f}, MFE {mfe:.2f}, total slippage {total_slippage}",
                 ),
             )
             conn.commit()
@@ -282,6 +317,9 @@ class AuditLogger:
                 exit_slippage=updated["exit_slippage"],
                 total_slippage=updated["total_slippage"],
                 realized_pnl=updated["realized_pnl"],
+                gross_pnl=updated["gross_pnl"] if "gross_pnl" in updated.keys() else 0.0,
+                total_charges=updated["total_charges"] if "total_charges" in updated.keys() else 0.0,
+                net_pnl=updated["net_pnl"] if "net_pnl" in updated.keys() else 0.0,
                 mae_inr=updated["mae_inr"],
                 mfe_inr=updated["mfe_inr"],
                 is_paper=bool(updated["is_paper"]),
@@ -309,6 +347,9 @@ class AuditLogger:
                 exit_slippage=row["exit_slippage"],
                 total_slippage=row["total_slippage"],
                 realized_pnl=row["realized_pnl"],
+                gross_pnl=row["gross_pnl"] if "gross_pnl" in row.keys() else 0.0,
+                total_charges=row["total_charges"] if "total_charges" in row.keys() else 0.0,
+                net_pnl=row["net_pnl"] if "net_pnl" in row.keys() else 0.0,
                 mae_inr=row["mae_inr"],
                 mfe_inr=row["mfe_inr"],
                 is_paper=bool(row["is_paper"]),
@@ -329,6 +370,9 @@ class AuditLogger:
                     "date": target_date,
                     "trade_count": 0,
                     "total_pnl": 0.0,
+                    "total_net_pnl": 0.0,
+                    "total_gross_pnl": 0.0,
+                    "total_charges": 0.0,
                     "win_rate": 0.0,
                     "avg_mae": 0.0,
                     "avg_mfe": 0.0,
@@ -336,6 +380,8 @@ class AuditLogger:
                 }
 
             pnls = [r["realized_pnl"] for r in rows]
+            gross_pnls = [r["gross_pnl"] if "gross_pnl" in r.keys() else r["realized_pnl"] for r in rows]
+            charges = [r["total_charges"] if "total_charges" in r.keys() else 0.0 for r in rows]
             maes = [r["mae_inr"] for r in rows]
             mfes = [r["mfe_inr"] for r in rows]
             slippages = [r["total_slippage"] for r in rows]
@@ -345,6 +391,9 @@ class AuditLogger:
                 "date": target_date,
                 "trade_count": len(rows),
                 "total_pnl": round(sum(pnls), 2),
+                "total_net_pnl": round(sum(pnls), 2),
+                "total_gross_pnl": round(sum(gross_pnls), 2),
+                "total_charges": round(sum(charges), 2),
                 "wins": wins,
                 "losses": len(rows) - wins,
                 "win_rate": round((wins / len(rows)) * 100.0, 1),

@@ -5,6 +5,19 @@
     "paper_trading": true,
     "timezone": "Asia/Kolkata"
   },
+  "capital": {
+    "starting_capital": 100000.0,
+    "currency": "INR"
+  },
+  "regulatory_charges": {
+    "brokerage_per_order": 20.0,
+    "stt_rate": 0.001,
+    "etc_rate": 0.0005,
+    "sebi_rate": 0.000001,
+    "stamp_duty_rate": 0.00003,
+    "gst_rate": 0.18
+  },
+  "starting_capital": 100000.0,
   "instrument": {
     "symbol": "NIFTY",
     "lot_size": 65,
