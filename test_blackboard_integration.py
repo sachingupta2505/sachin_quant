@@ -62,9 +62,9 @@ def test_blackboard_end_to_end_flow(clean_blackboard):
 
     # Coder calculates strikes and ensures Max Risk <= 1500
     width = 50.0
-    lot_size = 25
-    net_credit = 18.0
-    max_risk = (width * lot_size) - (net_credit * lot_size)  # 800 INR <= 1500
+    lot_size = 65
+    net_credit = 28.0
+    max_risk = (width * lot_size) - (net_credit * lot_size)  # 1430 INR <= 1500
     assert max_risk <= 1500.0
 
     order_id = bus.publish(

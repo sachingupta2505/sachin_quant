@@ -159,7 +159,17 @@ class RiskGuard:
         try:
             with open(temp_fd, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, default=str)
-            os.replace(temp_path, self.state_file)
+            replaced = False
+            for _ in range(5):
+                try:
+                    os.replace(temp_path, self.state_file)
+                    replaced = True
+                    break
+                except (PermissionError, OSError):
+                    time.sleep(0.05)
+            if not replaced:
+                with open(self.state_file, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, default=str)
         finally:
             if os.path.exists(temp_path):
                 try:

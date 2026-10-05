@@ -50,7 +50,7 @@ from agents.notifier import TelegramNotifier, notifier_worker
 from nfo_token_resolver import NFOTokenResolver
 
 IST = ZoneInfo("Asia/Kolkata")
-LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "25"))
+LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))
 MAX_PERMITTED_SPREAD_RISK_INR = 1500.0
 MAX_DAILY_LOSS_INR = float(os.getenv("MAX_DAILY_LOSS_INR", "-1500.0"))
 MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "2"))
@@ -255,9 +255,13 @@ def coder_worker(
             chosen_risk_inr = 0.0
 
             for width in candidate_widths:
+                # Dynamic credit to guarantee (width - net_credit) * LOT_SIZE <= 1500 INR
+                min_req_credit = width - (MAX_PERMITTED_SPREAD_RISK_INR / float(LOT_SIZE))
+                dynamic_credit = max(10.0, round(min_req_credit, 2))
+                net_credit = max(dynamic_credit + 0.5, dynamic_credit)
                 sell_prem = 75.0
-                buy_prem = max(57.0 - (width - 50.0) * 0.25, 20.0)
-                net_credit = sell_prem - buy_prem
+                buy_prem = round(sell_prem - net_credit, 2)
+                net_credit = round(sell_prem - buy_prem, 2)
                 net_premium_received = net_credit * LOT_SIZE
                 risk_inr = (width * LOT_SIZE) - net_premium_received
 

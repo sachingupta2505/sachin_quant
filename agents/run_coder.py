@@ -32,7 +32,7 @@ from bus import EventStatus, SystemBus
 from execution_engine import SignalType, SpreadType
 
 IST = ZoneInfo("Asia/Kolkata")
-LOT_SIZE = 25  # Official NSE Nifty derivatives lot size
+LOT_SIZE = 65  # Official NSE Nifty derivatives lot size
 MAX_PERMITTED_RISK_INR = 1500.0
 
 logging.basicConfig(
@@ -70,15 +70,18 @@ def run_coder():
             atm_strike = round(spot_price / 50.0) * 50.0
 
             # Dynamic candidate widths respecting MAX_PERMITTED_RISK_INR <= 1500
-            candidate_widths = [100.0, 50.0]
+            candidate_widths = [50.0]
             chosen_width = None
             chosen_credit = 0.0
             chosen_risk_inr = 0.0
 
             for width in candidate_widths:
+                # Dynamic minimum credit required so that (width - net_credit) * LOT_SIZE <= 1500
+                min_req_credit = width - (MAX_PERMITTED_RISK_INR / float(LOT_SIZE))
+                dynamic_credit = max(10.0, round(min_req_credit, 2))
+                net_credit = max(dynamic_credit + 0.5, dynamic_credit)
                 sell_prem = 75.0
-                buy_prem = max(57.0 - (width - 50.0) * 0.25, 20.0)
-                net_credit = sell_prem - buy_prem
+                buy_prem = sell_prem - net_credit
                 net_premium_received = net_credit * LOT_SIZE
                 risk_inr = (width * LOT_SIZE) - net_premium_received
 

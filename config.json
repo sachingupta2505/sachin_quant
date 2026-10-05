@@ -6,7 +6,7 @@
   },
   "instrument": {
     "symbol": "NIFTY",
-    "lot_size": 25,
+    "lot_size": 65,
     "strike_step": 50.0,
     "spread_width_pts": 50.0,
     "strategy": "DEFINED_RISK_CREDIT_SPREAD"

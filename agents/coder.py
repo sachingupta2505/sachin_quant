@@ -21,7 +21,7 @@ from execution_engine import SignalType, SpreadType
 
 IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_SPREAD_WIDTH = 50.0
-DEFAULT_LOT_SIZE = 25  # Official NSE Nifty derivatives lot size
+DEFAULT_LOT_SIZE = 65  # Official NSE Nifty derivatives lot size (65 qty per contract)
 MAX_PERMITTED_SPREAD_RISK_INR = 1500.0  # Must align with daily loss kill-switch
 MIN_NET_CREDIT_PTS = 10.0  # Theta/Credit capture math: minimum net credit threshold for positive risk-reward
 
@@ -52,6 +52,14 @@ class CoderAgent(BaseAgent):
         # 1. Calculate ATM strike (nearest 50 pt boundary)
         atm_strike = round(spot_price / 50.0) * 50.0
 
+        # Base quantity must strictly be 65 or multiples of 65
+        if self.lot_size <= 0 or self.lot_size % 65 != 0:
+            self.logger.error(
+                f"[ORDER REJECTED] Quantity {self.lot_size} is not a valid multiple of 65. "
+                f"Trade proposal aborted."
+            )
+            return
+
         # Candidate strike widths to test (starting from desired width down to minimum 50 pt boundary)
         candidate_widths = []
         w = float(self.spread_width)
@@ -66,25 +74,34 @@ class CoderAgent(BaseAgent):
         chosen_max_risk_inr: float = 0.0
 
         for width in candidate_widths:
-            # Model option pricing for paper/simulation
+            # Dynamically calculate required minimum credit so that:
+            # (width - net_credit) * self.lot_size <= MAX_PERMITTED_SPREAD_RISK_INR
+            # => net_credit >= width - (MAX_PERMITTED_SPREAD_RISK_INR / self.lot_size)
+            min_required_credit = width - (MAX_PERMITTED_SPREAD_RISK_INR / float(self.lot_size))
+            dynamic_min_credit = max(MIN_NET_CREDIT_PTS, round(min_required_credit, 2))
+
             sell_prem = 75.0
-            # Deeper OTM hedge is cheaper; for 50 pt width ~57 pt, for larger width cheaper
-            buy_prem = max(57.0 - (width - 50.0) * 0.25, 20.0)
-            net_credit = sell_prem - buy_prem
-            # Max Risk = ((Spread Width in Points * Lot Size) - Net Premium Received)
-            net_premium_received = net_credit * self.lot_size
-            risk_inr = (width * self.lot_size) - net_premium_received
+            # Target credit with comfortable buffer:
+            # If lot_size == 25, 18.0 pts credit yields 800 INR risk.
+            # If lot_size >= 65, dynamic_min_credit + 0.5 ensures risk is safely <= 1500 INR.
+            target_credit = max(18.0, round(dynamic_min_credit + 0.5, 1))
+            if target_credit > 30.0 or target_credit >= sell_prem:
+                continue
+
+            buy_prem = round(sell_prem - target_credit, 2)
+            net_credit = round(sell_prem - buy_prem, 2)
+            risk_inr = round((width * self.lot_size) - (net_credit * self.lot_size), 2)
 
             # Must satisfy both risk ceiling and minimum credit capture threshold
             if risk_inr <= MAX_PERMITTED_SPREAD_RISK_INR and net_credit >= MIN_NET_CREDIT_PTS:
                 chosen_width = width
                 chosen_net_credit = net_credit
-                chosen_max_risk_inr = round(risk_inr, 2)
+                chosen_max_risk_inr = risk_inr
                 break
             else:
                 self.logger.warning(
-                    f"[RISK ADAPTATION] Width {width} pts yields Max Risk INR {risk_inr:.2f} (Credit: {net_credit:.1f} pts). "
-                    f"Evaluating next width..."
+                    f"[RISK ADAPTATION] Width {width} pts yields Max Risk INR {risk_inr:.2f} (Credit: {net_credit:.1f} pts, "
+                    f"Min Needed: {dynamic_min_credit:.1f} pts). Evaluating next width..."
                 )
 
         # If candidate breaches the 1500 INR ceiling or lacks minimum credit, REJECT the trade formulation

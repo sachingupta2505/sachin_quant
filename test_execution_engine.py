@@ -122,7 +122,7 @@ def test_non_rejection_candle():
 
 
 def test_paper_trading_defined_risk_spread_execution(temp_rg: RiskGuard):
-    engine = ExecutionEngine(risk_guard=temp_rg, paper_trading=True, lot_size=25, spread_width_pts=50.0)
+    engine = ExecutionEngine(risk_guard=temp_rg, paper_trading=True, lot_size=65, spread_width_pts=50.0)
     assert engine.paper_trading is True
 
     # Bullish Signal
@@ -156,7 +156,7 @@ def test_paper_trading_defined_risk_spread_execution(temp_rg: RiskGuard):
     # Max risk must be strictly capped and defined <= 1500 INR
     assert spread.max_risk_inr > 0
     assert spread.max_risk_inr <= 1500.0
-    assert spread.max_risk_inr == (50.0 - spread.net_credit) * 25
+    assert spread.max_risk_inr == round((50.0 - spread.net_credit) * 65, 2)
 
     # 2. Execute Paper Trade
     executed = engine.execute_spread(spread)
@@ -178,7 +178,7 @@ def test_paper_trading_defined_risk_spread_execution(temp_rg: RiskGuard):
 
 
 def test_spread_execution_blocked_outside_trading_window(temp_rg: RiskGuard):
-    engine = ExecutionEngine(risk_guard=temp_rg, paper_trading=True, lot_size=25)
+    engine = ExecutionEngine(risk_guard=temp_rg, paper_trading=True, lot_size=65)
     early_candle = make_candle(9, 20, 25000, 25010, 24980, 25005)
     signal = RejectionSignal(
         signal_type=SignalType.BULLISH_REJECTION,
@@ -210,21 +210,21 @@ def test_spread_max_risk_strict_ceiling_enforced(temp_rg: RiskGuard):
         description="Bullish test",
     )
 
-    # Case 1: Standard 50-pt spread with lot_size=25 -> (50 - 18) * 25 = 800 INR <= 1500 INR (PASS)
-    engine_safe = ExecutionEngine(risk_guard=temp_rg, paper_trading=True, lot_size=25, spread_width_pts=50.0)
+    # Case 1: Standard 50-pt spread with lot_size=65 -> (50 - 27.5) * 65 = 1462.5 INR <= 1500 INR (PASS)
+    engine_safe = ExecutionEngine(risk_guard=temp_rg, paper_trading=True, lot_size=65, spread_width_pts=50.0)
     spread_safe = engine_safe.build_spread(signal, spot_price=25020.0, timestamp=candle.timestamp)
     assert spread_safe is not None
     assert spread_safe.max_risk_inr <= 1500.0
 
-    # Case 2: Desired width is 100 pts, which at lot_size 25 would be > 1500 INR.
+    # Case 2: Desired width is 100 pts, which at lot_size 65 would breach 1500 INR.
     # It must dynamically tighten to 50 pts so max risk <= 1500 INR.
-    engine_wide = ExecutionEngine(risk_guard=temp_rg, paper_trading=True, lot_size=25, spread_width_pts=100.0)
+    engine_wide = ExecutionEngine(risk_guard=temp_rg, paper_trading=True, lot_size=65, spread_width_pts=100.0)
     spread_tightened = engine_wide.build_spread(signal, spot_price=25020.0, timestamp=candle.timestamp)
     assert spread_tightened is not None
     assert spread_tightened.max_risk_inr <= 1500.0
     assert spread_tightened.metadata["width"] == 50.0  # Dynamically tightened to 50 pts
 
-    # Case 3: Oversized lot size (lot_size=75), where even minimum 50 pt spread is (50 - 18) * 75 = 2400 INR > 1500 INR.
+    # Case 3: Invalid/oversized lot size (lot_size=75), non-multiple of 65.
     # Must strictly REJECT the trade formulation and return None.
     engine_oversized = ExecutionEngine(risk_guard=temp_rg, paper_trading=True, lot_size=75, spread_width_pts=50.0)
     spread_rejected = engine_oversized.build_spread(signal, spot_price=25020.0, timestamp=candle.timestamp)
@@ -242,8 +242,8 @@ def test_coder_agent_spread_max_risk_1500_ceiling():
     def mock_dispatch(msg):
         dispatched_messages.append(msg)
 
-    # Test 1: Safe lot size (25) -> Dispatches proposed order with max_risk_inr <= 1500 INR
-    coder_safe = CoderAgent(dispatch_fn=mock_dispatch, spread_width=50.0, lot_size=25)
+    # Test 1: Safe lot size (65) -> Dispatches proposed order with max_risk_inr <= 1500 INR
+    coder_safe = CoderAgent(dispatch_fn=mock_dispatch, spread_width=50.0, lot_size=65)
     coder_safe.on_strategy_signal({
         "signal_type": SignalType.BULLISH_REJECTION.value,
         "spot_price": 25020.0,
@@ -254,9 +254,9 @@ def test_coder_agent_spread_max_risk_1500_ceiling():
     assert len(dispatched_messages) == 1
     proposed = dispatched_messages[0].payload
     assert proposed["max_risk_inr"] <= 1500.0
-    assert (proposed["spread_width"] * 25) - (proposed["net_credit"] * 25) <= 1500.0
+    assert (proposed["spread_width"] * 65) - (proposed["net_credit"] * 65) <= 1500.0
 
-    # Test 2: Oversized lot size (75) where 50 pt spread yields 2400 INR > 1500 INR
+    # Test 2: Oversized/invalid lot size (75) where quantity is not a multiple of 65
     # CoderAgent MUST reject trade formulation and NOT dispatch any order
     dispatched_messages.clear()
     coder_oversized = CoderAgent(dispatch_fn=mock_dispatch, spread_width=50.0, lot_size=75)

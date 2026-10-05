@@ -54,6 +54,48 @@ class AuditorAgent(BaseAgent):
     def audit_proposed_order(self, payload: dict) -> None:
         trade_id = payload["trade_id"]
         ts = payload.get("timestamp") or datetime.now(self.tz)
+        legs = payload.get("legs", [])
+
+        # 0. Enforce Nifty Lot Size = 65: order.quantity % 65 == 0
+        for leg in legs:
+            qty = int(leg.get("quantity", 0))
+            if qty <= 0 or qty % 65 != 0:
+                reason = f"Order leg quantity {qty} rejected: must strictly be a positive multiple of 65"
+                self.logger.warning(f"[AUDIT VETO] Order {trade_id} REJECTED! Reason: {reason}")
+                if self.dispatch_fn:
+                    veto_msg = AgentMessage(
+                        msg_id=f"REJ-{uuid.uuid4().hex[:6].upper()}",
+                        sender=self.name,
+                        recipient="Coder",
+                        msg_type=MessageType.AUDIT_REJECTED,
+                        payload={"trade_id": trade_id, "reason": reason, "timestamp": ts},
+                        timestamp=ts,
+                    )
+                    self.dispatch_fn(veto_msg)
+                return
+
+        # Recalculate single-trade maximum loss with multiplier 65
+        if len(legs) >= 2:
+            buy_leg = next((l for l in legs if l.get("action") == "BUY"), legs[0])
+            sell_leg = next((l for l in legs if l.get("action") == "SELL"), legs[1])
+            qty = int(buy_leg.get("quantity", 65))
+            spread_width = abs(float(buy_leg.get("strike", 0)) - float(sell_leg.get("strike", 0)))
+            net_credit = float(payload.get("net_credit", 0.0))
+            calculated_risk = round((spread_width * qty) - (net_credit * qty), 2)
+            if calculated_risk > 1500.0:
+                reason = f"Calculated max risk INR {calculated_risk:.2f} (multiplier {qty}) exceeds limit of INR 1500.0"
+                self.logger.warning(f"[AUDIT VETO] Order {trade_id} REJECTED! Reason: {reason}")
+                if self.dispatch_fn:
+                    veto_msg = AgentMessage(
+                        msg_id=f"REJ-{uuid.uuid4().hex[:6].upper()}",
+                        sender=self.name,
+                        recipient="Coder",
+                        msg_type=MessageType.AUDIT_REJECTED,
+                        payload={"trade_id": trade_id, "reason": reason, "timestamp": ts},
+                        timestamp=ts,
+                    )
+                    self.dispatch_fn(veto_msg)
+                return
 
         # 1. Enforce hard single-spread risk ceiling <= INR 1500
         max_risk_inr = float(payload.get("max_risk_inr", 0.0))

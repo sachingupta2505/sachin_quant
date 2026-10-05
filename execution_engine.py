@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -28,7 +29,7 @@ from nfo_token_resolver import NFOTokenResolver
 
 logger = logging.getLogger("execution_engine")
 IST = ZoneInfo("Asia/Kolkata")
-NIFTY_LOT_SIZE = 25  # Official NSE Nifty derivatives lot size
+NIFTY_LOT_SIZE = 65  # Official NSE Nifty derivatives lot size (65 qty per contract)
 MAX_SPREAD_RISK_INR = 1500.0  # Hard single-spread risk ceiling (aligned with daily kill-switch)
 
 
@@ -491,6 +492,14 @@ class ExecutionEngine:
         dt = timestamp or signal.candle.timestamp
         trade_id = f"SPD-{dt.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4].upper()}"
 
+        # Base quantity must strictly be 65 or multiples of 65
+        if self.lot_size <= 0 or self.lot_size % 65 != 0:
+            logger.error(
+                f"[BUILD SPREAD REJECTED] Quantity {self.lot_size} is not a valid multiple of 65. "
+                f"Trade proposal aborted."
+            )
+            return None
+
         # Nearest 50-pt strike
         atm_strike = round(spot_price / 50.0) * 50.0
 
@@ -504,15 +513,24 @@ class ExecutionEngine:
         chosen_max_risk_inr: float = 0.0
 
         for width in candidate_widths:
+            # Dynamically calculate required minimum credit so that:
+            # (width - net_credit) * self.lot_size <= MAX_SPREAD_RISK_INR
+            min_required_credit = width - (MAX_SPREAD_RISK_INR / float(self.lot_size))
+            dynamic_min_credit = max(10.0, round(min_required_credit, 2))
+
             sell_prem = 75.0
-            buy_prem = max(57.0 - (width - 50.0) * 0.25, 20.0)
-            net_credit = sell_prem - buy_prem
-            risk_inr = (width * self.lot_size) - (net_credit * self.lot_size)
+            target_credit = max(18.0, round(dynamic_min_credit + 0.5, 1))
+            if target_credit > 30.0 or target_credit >= sell_prem:
+                continue
+
+            buy_prem = round(sell_prem - target_credit, 2)
+            net_credit = round(sell_prem - buy_prem, 2)
+            risk_inr = round((width * self.lot_size) - (net_credit * self.lot_size), 2)
 
             if risk_inr <= MAX_SPREAD_RISK_INR:
                 chosen_width = width
                 chosen_net_credit = net_credit
-                chosen_max_risk_inr = round(risk_inr, 2)
+                chosen_max_risk_inr = risk_inr
                 break
             else:
                 logger.warning(
@@ -650,31 +668,89 @@ class ExecutionEngine:
 
             placed_orders: list[str] = []
             try:
-                for leg in spread.legs:
-                    resolved_sym, resolved_tok = self.token_resolver.resolve_token(
-                        symbol="NIFTY",
-                        strike=leg.strike,
-                        option_type=leg.option_type,
+                # 2-Leg Incomplete Fill Guard: BUY hedge leg placed first, then SELL short leg
+                buy_leg = spread.legs[0]
+                sell_leg = spread.legs[1] if len(spread.legs) > 1 else None
+
+                # Place Leg 1: BUY Hedge
+                buy_sym, buy_tok = self.token_resolver.resolve_token(
+                    symbol="NIFTY", strike=buy_leg.strike, option_type=buy_leg.option_type
+                )
+                buy_params = {
+                    "variety": "NORMAL",
+                    "tradingsymbol": buy_sym,
+                    "symboltoken": buy_tok,
+                    "transactiontype": buy_leg.action,
+                    "exchange": "NFO",
+                    "ordertype": "LIMIT",
+                    "producttype": "INTRADAY",
+                    "duration": "DAY",
+                    "price": str(buy_leg.price),
+                    "quantity": str(buy_leg.quantity),
+                }
+                resp_buy = self.auth.smart_api.placeOrder(buy_params)
+                if not resp_buy or not resp_buy.get("status"):
+                    raise RuntimeError(f"BUY hedge leg order failed: {resp_buy}")
+                buy_oid = resp_buy["data"]["orderid"]
+                buy_leg.order_id = buy_oid
+                placed_orders.append(buy_oid)
+
+                # Place Leg 2: SELL Short
+                if sell_leg:
+                    sell_sym, sell_tok = self.token_resolver.resolve_token(
+                        symbol="NIFTY", strike=sell_leg.strike, option_type=sell_leg.option_type
                     )
-                    order_params = {
+                    sell_params = {
                         "variety": "NORMAL",
-                        "tradingsymbol": resolved_sym,
-                        "symboltoken": resolved_tok,
-                        "transactiontype": leg.action,
+                        "tradingsymbol": sell_sym,
+                        "symboltoken": sell_tok,
+                        "transactiontype": sell_leg.action,
                         "exchange": "NFO",
                         "ordertype": "LIMIT",
                         "producttype": "INTRADAY",
                         "duration": "DAY",
-                        "price": str(leg.price),
-                        "quantity": str(leg.quantity),
+                        "price": str(sell_leg.price),
+                        "quantity": str(sell_leg.quantity),
                     }
-                    resp = self.auth.smart_api.placeOrder(order_params)
-                    if resp and resp.get("status"):
-                        order_id = resp["data"]["orderid"]
-                        leg.order_id = order_id
-                        placed_orders.append(order_id)
-                    else:
-                        raise RuntimeError(f"Order placement failed for {leg.symbol}: {resp}")
+                    resp_sell = self.auth.smart_api.placeOrder(sell_params)
+                    if not resp_sell or not resp_sell.get("status"):
+                        raise RuntimeError(f"SELL short leg order failed: {resp_sell}")
+                    sell_oid = resp_sell["data"]["orderid"]
+                    sell_leg.order_id = sell_oid
+                    placed_orders.append(sell_oid)
+
+                    # Monitor Leg 2 fill for up to 5.0 seconds
+                    fill_timeout = 5.0
+                    sell_filled = self._wait_for_leg_fill(sell_oid, timeout_sec=fill_timeout)
+                    if not sell_filled:
+                        # Cancel pending SELL limit order
+                        try:
+                            self.auth.smart_api.cancelOrder(sell_oid, "NORMAL")
+                        except Exception:
+                            pass
+
+                        # Fire immediate emergency MARKET square-off for BUY hedge leg
+                        sq_params = {
+                            "variety": "NORMAL",
+                            "tradingsymbol": buy_sym,
+                            "symboltoken": buy_tok,
+                            "transactiontype": "SELL",
+                            "exchange": "NFO",
+                            "ordertype": "MARKET",
+                            "producttype": "INTRADAY",
+                            "duration": "DAY",
+                            "price": "0",
+                            "quantity": str(buy_leg.quantity),
+                        }
+                        try:
+                            self.auth.smart_api.placeOrder(sq_params)
+                        except Exception as sq_err:
+                            logger.critical(f"Emergency square-off error: {sq_err}")
+
+                        msg_desc = "LEG_FILL_TIMEOUT: Emergency square-off executed to prevent naked long hedge"
+                        logger.critical(f"[EMERGENCY 2-LEG GUARD] {msg_desc}")
+                        self.active_spread = None
+                        raise RuntimeError(msg_desc)
 
                 spread.status = "FILLED"
                 self.active_spread = spread
@@ -700,6 +776,27 @@ class ExecutionEngine:
                     except Exception:
                         pass
                 return False
+
+    def _wait_for_leg_fill(self, order_id: str, timeout_sec: float = 5.0) -> bool:
+        """Polls broker orderBook for order fill status up to timeout_sec."""
+        start_t = time.time()
+        while time.time() - start_t < timeout_sec:
+            if not self.auth or not self.auth.smart_api:
+                return True
+            try:
+                book = self.auth.smart_api.orderBook()
+                if book and book.get("status") and book.get("data"):
+                    for ord_entry in book["data"]:
+                        if str(ord_entry.get("orderid")) == str(order_id):
+                            st = str(ord_entry.get("orderstatus", "")).lower()
+                            if st in ("complete", "filled"):
+                                return True
+                            elif st in ("cancelled", "rejected"):
+                                return False
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False
 
     def close_active_spread(self, realized_pnl: float, exit_time: Optional[datetime] = None) -> bool:
         """

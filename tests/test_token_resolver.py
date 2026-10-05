@@ -222,7 +222,7 @@ def test_devops_agent_order_execution_with_token_resolver(tmp_path: Path, sample
                 "strike": 24950.0,
                 "option_type": "PE",
                 "action": "BUY",
-                "quantity": 25,
+                "quantity": 65,
                 "price": 55.0,
             },
             {
@@ -230,7 +230,7 @@ def test_devops_agent_order_execution_with_token_resolver(tmp_path: Path, sample
                 "strike": 25000.0,
                 "option_type": "PE",
                 "action": "SELL",
-                "quantity": 25,
+                "quantity": 65,
                 "price": 75.0,
             },
         ],
