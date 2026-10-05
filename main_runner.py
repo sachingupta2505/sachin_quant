@@ -766,8 +766,10 @@ def live_market_feed_worker(
             ib_locked = True
             ib_tracker.lock_manual()
             ib = ib_tracker.get_ib()
-            final_high = ib.high if ib.high > 0 else ib_high
-            final_low = ib.low if ib.low > 0 and ib.low < float("inf") else ib_low
+            effective_high = ib_high if ib_high > 0 else ltp
+            effective_low = ib_low if (ib_low > 0 and ib_low < float("inf")) else ltp
+            final_high = ib.high if (ib is not None and ib.high > 0) else effective_high
+            final_low = ib.low if (ib is not None and ib.low > 0 and ib.low < float("inf")) else effective_low
             final_range = final_high - final_low
             logger.info("=" * 65)
             logger.info(
@@ -961,8 +963,10 @@ def run_live_market(
                 ib_tracker.lock_manual()
                 ib = ib_tracker.get_ib()
                 # If during off-hours/testing ib_high was set from ticks
-                final_high = ib.high if ib.high > 0 else ib_high
-                final_low = ib.low if ib.low > 0 and ib.low < float("inf") else ib_low
+                effective_high = ib_high if ib_high > 0 else ltp
+                effective_low = ib_low if (ib_low > 0 and ib_low < float("inf")) else ltp
+                final_high = ib.high if (ib is not None and ib.high > 0) else effective_high
+                final_low = ib.low if (ib is not None and ib.low > 0 and ib.low < float("inf")) else effective_low
                 final_range = final_high - final_low
                 logger.info("=" * 65)
                 logger.info(
