@@ -27,6 +27,7 @@ daily_state.json
 system_state.json
 reports/
 all_code.txt
+data/
 data/nfo_instruments.json
 
 # Node

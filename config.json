@@ -2,6 +2,7 @@
   "system": {
     "version": "1.0.0",
     "mode": "PAPER_TRADING",
+    "paper_trading": true,
     "timezone": "Asia/Kolkata"
   },
   "instrument": {
