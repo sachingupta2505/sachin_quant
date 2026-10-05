@@ -9,11 +9,13 @@ Features:
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
+from pathlib import Path
 from typing import Any, Optional, Sequence
 from zoneinfo import ZoneInfo
 
@@ -169,9 +171,17 @@ class RejectionDetector:
         spot_price: float,
         swing_highs: Optional[Sequence[float]] = None,
         swing_lows: Optional[Sequence[float]] = None,
+        daily_levels: Optional[dict[str, float]] = None,
+        weekly_levels: Optional[dict[str, float]] = None,
+        pdh: Optional[float] = None,
+        pdl: Optional[float] = None,
+        pdc: Optional[float] = None,
+        pwh: Optional[float] = None,
+        pwl: Optional[float] = None,
     ) -> list[SRZone]:
         """
-        Computes key Support & Resistance zones using Initial Balance (IBH/IBL)
+        Computes key Support & Resistance zones using Initial Balance (IBH/IBL),
+        Daily/Weekly higher timeframe reference levels (PDH, PDL, PDC, PWH, PWL),
         and psychological/strike levels (multiples of 50/100).
         """
         zones: list[SRZone] = []
@@ -179,6 +189,29 @@ class RejectionDetector:
         if ib is not None:
             zones.append(SRZone(name="IB_HIGH_RESISTANCE", level=ib.high))
             zones.append(SRZone(name="IB_LOW_SUPPORT", level=ib.low))
+
+        # Higher Timeframe Reference Levels (Daily: PDH, PDL, PDC)
+        if daily_levels:
+            pdh = daily_levels.get("pdh", daily_levels.get("PDH", pdh))
+            pdl = daily_levels.get("pdl", daily_levels.get("PDL", pdl))
+            pdc = daily_levels.get("pdc", daily_levels.get("PDC", pdc))
+
+        # Higher Timeframe Reference Levels (Weekly: PWH, PWL)
+        if weekly_levels:
+            pwh = weekly_levels.get("pwh", weekly_levels.get("PWH", pwh))
+            pwl = weekly_levels.get("pwl", weekly_levels.get("PWL", pwl))
+
+        if pdh is not None and float(pdh) > 0:
+            zones.append(SRZone(name="DAILY_HIGH_RES", level=float(pdh)))
+        if pdl is not None and float(pdl) > 0:
+            zones.append(SRZone(name="DAILY_LOW_SUP", level=float(pdl)))
+        if pdc is not None and float(pdc) > 0:
+            zones.append(SRZone(name="DAILY_CLOSE_PIVOT", level=float(pdc)))
+
+        if pwh is not None and float(pwh) > 0:
+            zones.append(SRZone(name="WEEKLY_HIGH_RES", level=float(pwh)))
+        if pwl is not None and float(pwl) > 0:
+            zones.append(SRZone(name="WEEKLY_LOW_SUP", level=float(pwl)))
 
         # Psychological / Strike boundaries (nearest 50-pt strikes around spot)
         base = round(spot_price / 50.0) * 50.0
@@ -267,6 +300,146 @@ class RejectionDetector:
             confidence=0.0,
             description="No rejection criteria met.",
         )
+
+
+def fetch_historical_reference_levels(
+    auth: Optional[Any] = None,
+    symbol_token: str = "99926000",
+    cache_file: str = "daily_reference_levels.json",
+    fallback_spot: Optional[float] = None,
+) -> dict[str, Any]:
+    """
+    Fetches previous day (PDH, PDL, PDC) and previous week (PWH, PWL) reference levels
+    using Angel One SmartAPI getCandleData with robust fallback to a local JSON cache.
+    """
+    cache_path = Path(cache_file)
+    if not cache_path.is_absolute():
+        cache_path = Path(__file__).resolve().parent / cache_file
+
+    smart_api = None
+    if auth is not None:
+        if hasattr(auth, "getCandleData"):
+            smart_api = auth
+        elif hasattr(auth, "smart_api"):
+            smart_api = auth.smart_api
+
+    # Attempt 1: Fetch live historical candle data via SmartAPI
+    if smart_api is not None:
+        try:
+            now = datetime.now(IST)
+            from_date = (now - timedelta(days=35)).strftime("%Y-%m-%d 09:15")
+            to_date = now.strftime("%Y-%m-%d 15:30")
+            payload = {
+                "exchange": "NSE",
+                "symboltoken": str(symbol_token),
+                "interval": "ONE_DAY",
+                "fromdate": from_date,
+                "todate": to_date,
+            }
+            resp = smart_api.getCandleData(payload)
+            if resp and isinstance(resp, dict) and resp.get("status") and resp.get("data"):
+                raw_candles = resp["data"]
+                # Candle schema: [timestamp, open, high, low, close, volume]
+                # Filter strictly past trading days (prior to today in IST)
+                today_date = now.date()
+                parsed_candles = []
+                for c in raw_candles:
+                    if not c or len(c) < 5:
+                        continue
+                    ts_str = str(c[0])
+                    try:
+                        clean_ts = ts_str.split("T")[0].split(" ")[0]
+                        c_date = datetime.strptime(clean_ts, "%Y-%m-%d").date()
+                    except Exception:
+                        continue
+                    if c_date < today_date:
+                        parsed_candles.append({
+                            "date": c_date,
+                            "open": float(c[1]),
+                            "high": float(c[2]),
+                            "low": float(c[3]),
+                            "close": float(c[4]),
+                        })
+
+                if parsed_candles:
+                    # Last completed trading day
+                    prev_day = parsed_candles[-1]
+                    pdh = round(prev_day["high"], 2)
+                    pdl = round(prev_day["low"], 2)
+                    pdc = round(prev_day["close"], 2)
+
+                    # Determine Previous Week (Monday to Friday of previous week)
+                    cur_monday = today_date - timedelta(days=today_date.weekday())
+                    prev_monday = cur_monday - timedelta(days=7)
+                    prev_week_candles = [
+                        c for c in parsed_candles
+                        if prev_monday <= c["date"] < cur_monday
+                    ]
+                    if not prev_week_candles:
+                        prev_week_candles = [c for c in parsed_candles if c["date"] < cur_monday][-5:]
+                    if not prev_week_candles:
+                        prev_week_candles = parsed_candles[-5:]
+
+                    pwh = round(max(c["high"] for c in prev_week_candles), 2)
+                    pwl = round(min(c["low"] for c in prev_week_candles), 2)
+
+                    data = {
+                        "pdh": pdh,
+                        "pdl": pdl,
+                        "pdc": pdc,
+                        "pwh": pwh,
+                        "pwl": pwl,
+                        "daily": {"pdh": pdh, "pdl": pdl, "pdc": pdc},
+                        "weekly": {"pwh": pwh, "pwl": pwl},
+                        "timestamp": now.isoformat(),
+                        "source": "SMART_API",
+                    }
+                    try:
+                        cache_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                        logger.info(f"Updated S/R reference levels cache at {cache_path}")
+                    except Exception as we:
+                        logger.warning(f"Could not persist levels to cache {cache_path}: {we}")
+                    return data
+        except Exception as e:
+            logger.warning(f"Error fetching historical candles via SmartAPI: {e}. Falling back to cache.")
+
+    # Attempt 2: Load from local JSON cache file
+    if cache_path.exists():
+        try:
+            content = cache_path.read_text(encoding="utf-8")
+            cached = json.loads(content)
+            if all(k in cached for k in ("pdh", "pdl", "pdc", "pwh", "pwl")):
+                cached["daily"] = cached.get("daily", {"pdh": cached["pdh"], "pdl": cached["pdl"], "pdc": cached["pdc"]})
+                cached["weekly"] = cached.get("weekly", {"pwh": cached["pwh"], "pwl": cached["pwl"]})
+                cached["source"] = "LOCAL_CACHE"
+                logger.info(f"Loaded S/R reference levels from cache {cache_path}: PDH={cached['pdh']}, PDL={cached['pdl']}")
+                return cached
+        except Exception as e:
+            logger.warning(f"Failed to read cache file {cache_path}: {e}")
+
+    # Attempt 3: Safe synthetic fallback (around spot price or 25000)
+    base_spot = fallback_spot if (fallback_spot is not None and fallback_spot > 0) else 25000.0
+    pdh = round(base_spot + 120.0, 2)
+    pdl = round(base_spot - 120.0, 2)
+    pdc = round(base_spot + 15.0, 2)
+    pwh = round(base_spot + 280.0, 2)
+    pwl = round(base_spot - 280.0, 2)
+    fallback_data = {
+        "pdh": pdh,
+        "pdl": pdl,
+        "pdc": pdc,
+        "pwh": pwh,
+        "pwl": pwl,
+        "daily": {"pdh": pdh, "pdl": pdl, "pdc": pdc},
+        "weekly": {"pwh": pwh, "pwl": pwl},
+        "timestamp": datetime.now(IST).isoformat(),
+        "source": "FALLBACK_DEFAULT",
+    }
+    try:
+        cache_path.write_text(json.dumps(fallback_data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return fallback_data
 
 
 class ExecutionEngine:

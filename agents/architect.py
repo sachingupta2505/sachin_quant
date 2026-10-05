@@ -13,12 +13,17 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
 from agents.base import AgentMessage, BaseAgent, MessageType
 from regime_filter import Candle, InitialBalance, MarketRegime, RegimeFilter
-from execution_engine import RejectionDetector, SignalType, SRZone
+from execution_engine import (
+    RejectionDetector,
+    SignalType,
+    SRZone,
+    fetch_historical_reference_levels,
+)
 
 IST = ZoneInfo("Asia/Kolkata")
 EXPIRY_CUTOFF_TIME: time = time(13, 30)  # 01:30 PM IST: Cut off new signals on expiry days to eliminate high-gamma risk
@@ -35,6 +40,9 @@ class ArchitectAgent(BaseAgent):
         self,
         dispatch_fn: Optional[Callable[[AgentMessage], None]] = None,
         tz: ZoneInfo = IST,
+        auth: Optional[Any] = None,
+        daily_levels: Optional[dict[str, float]] = None,
+        weekly_levels: Optional[dict[str, float]] = None,
     ):
         super().__init__(name="Architect")
         self.dispatch_fn = dispatch_fn
@@ -42,6 +50,26 @@ class ArchitectAgent(BaseAgent):
         self.regime_filter = RegimeFilter(tz=tz)
         self.rejection_detector = RejectionDetector()
         self._recent_candles: list[Candle] = []
+        self.auth = auth
+        self.daily_levels = daily_levels or {}
+        self.weekly_levels = weekly_levels or {}
+        if not self.daily_levels or not self.weekly_levels:
+            ref = fetch_historical_reference_levels(auth=self.auth)
+            if not self.daily_levels:
+                self.daily_levels = ref.get("daily", {"pdh": ref.get("pdh"), "pdl": ref.get("pdl"), "pdc": ref.get("pdc")})
+            if not self.weekly_levels:
+                self.weekly_levels = ref.get("weekly", {"pwh": ref.get("pwh"), "pwl": ref.get("pwl")})
+
+    def set_reference_levels(
+        self,
+        daily_levels: Optional[dict[str, float]] = None,
+        weekly_levels: Optional[dict[str, float]] = None,
+    ) -> None:
+        """Update daily and weekly reference levels at runtime."""
+        if daily_levels:
+            self.daily_levels.update(daily_levels)
+        if weekly_levels:
+            self.weekly_levels.update(weekly_levels)
 
     def is_expiry_day(self, dt: datetime) -> bool:
         return is_expiry_day(dt)
@@ -91,9 +119,14 @@ class ArchitectAgent(BaseAgent):
             f"[Regime Validated] {regime_analysis.regime.value} - Favorable price action structure."
         )
 
-        # 3. Identify S/R Zones
+        # 3. Identify S/R Zones (including Daily & Weekly higher timeframe levels)
         ib = self.regime_filter.ib_tracker.get_ib()
-        zones = self.rejection_detector.identify_sr_zones(ib=ib, spot_price=candle.close)
+        zones = self.rejection_detector.identify_sr_zones(
+            ib=ib,
+            spot_price=candle.close,
+            daily_levels=self.daily_levels,
+            weekly_levels=self.weekly_levels,
+        )
 
         # 4. Check for 5-min Rejection Candle (wick ratio >= 50%)
         rejection_signal = self.rejection_detector.detect_rejection(candle, zones)
