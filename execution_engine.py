@@ -307,6 +307,39 @@ class RejectionDetector:
             description="No rejection criteria met.",
         )
 
+    def validate_confirmation(
+        self,
+        rejection_signal: RejectionSignal,
+        confirmation_candle: Candle,
+    ) -> tuple[bool, str]:
+        """
+        Validates subsequent 5-minute confirmation candle:
+        - Bull Put Spread: Next candle must cross above the high of the rejection candle.
+          Invalidated if the candle breaks below the low of the rejection candle.
+        - Bear Call Spread: Next candle must cross below the low of the rejection candle.
+          Invalidated if the candle breaks above the high of the rejection candle.
+        Returns: (confirmed: bool, reason: str)
+        """
+        if rejection_signal.signal_type == SignalType.BULLISH_REJECTION:
+            # Invalidation: breaks below the rejection candle wick low
+            if confirmation_candle.low < rejection_signal.candle.low:
+                return False, f"Invalidated: Candle low ({confirmation_candle.low:.1f}) broke below rejection low ({rejection_signal.candle.low:.1f})"
+            # Confirmation: crosses above the rejection candle high
+            if confirmation_candle.high > rejection_signal.candle.high:
+                return True, f"Confirmed: Crossed above rejection high ({confirmation_candle.high:.1f} > {rejection_signal.candle.high:.1f})"
+            return False, f"Failed: Did not cross above rejection high ({confirmation_candle.high:.1f} <= {rejection_signal.candle.high:.1f})"
+
+        elif rejection_signal.signal_type == SignalType.BEARISH_REJECTION:
+            # Invalidation: breaks above the rejection candle wick high
+            if confirmation_candle.high > rejection_signal.candle.high:
+                return False, f"Invalidated: Candle high ({confirmation_candle.high:.1f}) broke above rejection high ({rejection_signal.candle.high:.1f})"
+            # Confirmation: crosses below the rejection candle low
+            if confirmation_candle.low < rejection_signal.candle.low:
+                return True, f"Confirmed: Crossed below rejection low ({confirmation_candle.low:.1f} < {rejection_signal.candle.low:.1f})"
+            return False, f"Failed: Did not cross below rejection low ({confirmation_candle.low:.1f} >= {rejection_signal.candle.low:.1f})"
+
+        return False, "No active rejection signal to confirm."
+
 
 def fetch_historical_reference_levels(
     auth: Optional[Any] = None,

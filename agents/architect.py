@@ -26,13 +26,15 @@ from execution_engine import (
 )
 
 IST = ZoneInfo("Asia/Kolkata")
-EXPIRY_CUTOFF_TIME: time = time(13, 30)  # 01:30 PM IST: Cut off new signals on expiry days to eliminate high-gamma risk
-MAX_INDIA_VIX: float = 24.0             # Volatility expansion limit: halt fresh entries if India VIX / IV expands violently (> 24.0)
+EXPIRY_ENTRY_CUTOFF_TIME: time = time(12, 30)  # 12:30 PM IST: Freeze fresh trade entries on expiry days to eliminate 0DTE gamma spikes
+EXPIRY_CUTOFF_TIME: time = time(13, 30)        # 01:30 PM IST: Mandatory gamma cut-off & square-off on expiry days
+EXPIRY_SQUARE_OFF_TIME: time = time(13, 30)    # 01:30 PM IST: Position square-off limit
+MAX_INDIA_VIX: float = 24.0                   # Volatility expansion limit: halt fresh entries if India VIX / IV expands violently (> 24.0)
 
 
 def is_expiry_day(dt: datetime) -> bool:
-    """NSE Nifty weekly options contracts expire on Thursdays (weekday 3)."""
-    return dt.weekday() == 3
+    """NSE Nifty weekly options contracts expire on Tuesdays (weekday 1) or Thursdays (weekday 3)."""
+    return dt.weekday() in (1, 3)
 
 
 class ArchitectAgent(BaseAgent):
@@ -43,13 +45,16 @@ class ArchitectAgent(BaseAgent):
         auth: Optional[Any] = None,
         daily_levels: Optional[dict[str, float]] = None,
         weekly_levels: Optional[dict[str, float]] = None,
+        require_confirmation: bool = True,
     ):
         super().__init__(name="Architect")
         self.dispatch_fn = dispatch_fn
         self.tz = tz
+        self.require_confirmation = require_confirmation
         self.regime_filter = RegimeFilter(tz=tz)
         self.rejection_detector = RejectionDetector()
         self._recent_candles: list[Candle] = []
+        self.pending_rejection: Optional[RejectionSignal] = None
         self.auth = auth
         self.daily_levels = daily_levels or {}
         self.weekly_levels = weekly_levels or {}
@@ -80,10 +85,11 @@ class ArchitectAgent(BaseAgent):
             self.on_candle(candle)
 
     def on_candle(self, candle: Candle) -> None:
-        # Invariant: Restrict new strategy signals after 13:30 IST on expiry days to eliminate high-gamma risk
-        if is_expiry_day(candle.timestamp) and candle.timestamp.time() >= EXPIRY_CUTOFF_TIME:
+        # Invariant: Freeze fresh trade entries after 12:30 IST on expiry days to eliminate 0DTE gamma spikes (EXPIRY_CUTOFF_TIME)
+        if is_expiry_day(candle.timestamp) and (candle.timestamp.time() >= EXPIRY_ENTRY_CUTOFF_TIME or candle.timestamp.time() >= EXPIRY_CUTOFF_TIME):
+            self.pending_rejection = None
             self.logger.info(
-                f"[EXPIRY GAMMA CUTOFF] Signals blocked after {EXPIRY_CUTOFF_TIME.strftime('%H:%M')} IST on expiry days."
+                f"[EXPIRY GAMMA CUTOFF] Signals blocked after {EXPIRY_ENTRY_CUTOFF_TIME.strftime('%H:%M')} IST on expiry days."
             )
             return
 
@@ -119,7 +125,46 @@ class ArchitectAgent(BaseAgent):
             f"[Regime Validated] {regime_analysis.regime.value} - Favorable price action structure."
         )
 
-        # 3. Identify S/R Zones (including Daily & Weekly higher timeframe levels)
+        # 3. Check Pending Rejection Confirmation (Candle Confirmation Filter)
+        if self.pending_rejection is not None:
+            confirmed, reason = self.rejection_detector.validate_confirmation(
+                self.pending_rejection, candle
+            )
+            if confirmed:
+                sig = self.pending_rejection
+                self.pending_rejection = None
+                self.logger.info(
+                    f"[CONFIRMATION CONFIRMED] {sig.description} confirmed by candle {candle.timestamp.strftime('%H:%M')} ({reason})."
+                )
+                if self.dispatch_fn:
+                    msg = AgentMessage(
+                        msg_id=f"SIG-{uuid.uuid4().hex[:6].upper()}",
+                        sender=self.name,
+                        recipient="Coder",
+                        msg_type=MessageType.STRATEGY_SIGNAL,
+                        payload={
+                            "signal_type": sig.signal_type.value,
+                            "spot_price": candle.close,
+                            "candle": candle,
+                            "rejection_candle": sig.candle,
+                            "zone_name": sig.zone.name,
+                            "zone_level": sig.zone.level,
+                            "wick_ratio": sig.wick_ratio,
+                            "confidence": sig.confidence,
+                            "description": f"{sig.description} [Confirmed: {reason}]",
+                            "timestamp": candle.timestamp,
+                        },
+                        timestamp=candle.timestamp,
+                    )
+                    self.dispatch_fn(msg)
+                return
+            else:
+                self.logger.info(
+                    f"[CONFIRMATION FILTER] Rejection invalidated: {reason}. Signal cancelled."
+                )
+                self.pending_rejection = None
+
+        # 4. Identify S/R Zones (including Daily & Weekly higher timeframe levels)
         ib = self.regime_filter.ib_tracker.get_ib()
         zones = self.rejection_detector.identify_sr_zones(
             ib=ib,
@@ -128,16 +173,25 @@ class ArchitectAgent(BaseAgent):
             weekly_levels=self.weekly_levels,
         )
 
-        # 4. Check for 5-min Rejection Candle (wick ratio >= 50%)
+        # 5. Check for 5-min Rejection Candle (wick ratio >= 50%)
         rejection_signal = self.rejection_detector.detect_rejection(candle, zones)
         if rejection_signal.signal_type == SignalType.NONE:
             return
 
+        if self.require_confirmation:
+            self.pending_rejection = rejection_signal
+            target_direction = "cross above high" if rejection_signal.signal_type == SignalType.BULLISH_REJECTION else "cross below low"
+            self.logger.info(
+                f"[REJECTION DETECTED - AWAITING CONFIRMATION] {rejection_signal.description}. "
+                f"Waiting for subsequent candle to {target_direction}..."
+            )
+            return
+
+        # Immediate dispatch when confirmation filter is disabled
         self.logger.info(
             f"[EDGE CONFIRMED] {rejection_signal.description} (Confidence: {rejection_signal.confidence})"
         )
 
-        # 5. Dispatch Strategy Signal to Coder Agent
         if self.dispatch_fn:
             msg = AgentMessage(
                 msg_id=f"SIG-{uuid.uuid4().hex[:6].upper()}",

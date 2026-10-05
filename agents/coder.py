@@ -3,9 +3,9 @@ Coder Agent
 Role: Quantitative Order Payload Synthesizer & Dynamic Risk Adjuster
 Responsibilities:
 1. Receives validated strategy signals from Architect Agent.
-2. Dynamically calculates strike prices (ATM sell leg vs OTM hedge leg).
+2. Dynamically calculates strike prices (safe OTM credit spreads: delta 0.15 - 0.25, 10-16 pts credit).
 3. Adapts order payloads based on market conditions, lot sizes, and spread widths.
-4. Formulates defined-risk 2-leg option spread structures.
+4. Enforces defined Stop-Loss Exit Rule (stop loss strictly capped at entry_credit * 2.0 or max 20 pts).
 5. Emits PROPOSED_ORDER message to Auditor Agent for strict compliance gating.
 """
 
@@ -23,7 +23,9 @@ IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_SPREAD_WIDTH = 50.0
 DEFAULT_LOT_SIZE = 65  # Official NSE Nifty derivatives lot size (65 qty per contract)
 MAX_PERMITTED_SPREAD_RISK_INR = 1500.0  # Must align with daily loss kill-switch
-MIN_NET_CREDIT_PTS = 10.0  # Theta/Credit capture math: minimum net credit threshold for positive risk-reward
+MIN_NET_CREDIT_PTS = 10.0  # Minimum credit capture threshold (targets 10 - 16 pts for safe OTM spreads)
+MAX_NET_CREDIT_PTS = 16.0  # Upper bound for OTM delta 0.15 - 0.25 options
+MAX_STOP_LOSS_PTS = 20.0   # Maximum adverse excursion cap on option spread (pts)
 
 
 class CoderAgent(BaseAgent):
@@ -60,7 +62,7 @@ class CoderAgent(BaseAgent):
             )
             return
 
-        # Candidate strike widths to test (starting from desired width down to minimum 50 pt boundary)
+        # 2. Select Spread Width (minimum 50 pt boundary)
         candidate_widths = []
         w = float(self.spread_width)
         while w >= 50.0:
@@ -69,56 +71,40 @@ class CoderAgent(BaseAgent):
         if not candidate_widths:
             candidate_widths = [50.0]
 
-        chosen_width: Optional[float] = None
-        chosen_net_credit: float = 0.0
-        chosen_max_risk_inr: float = 0.0
+        # Use standard 50 pt spread width for high-probability OTM credit
+        chosen_width = candidate_widths[-1] if candidate_widths else 50.0
 
-        for width in candidate_widths:
-            # Dynamically calculate required minimum credit so that:
-            # (width - net_credit) * self.lot_size <= MAX_PERMITTED_SPREAD_RISK_INR
-            # => net_credit >= width - (MAX_PERMITTED_SPREAD_RISK_INR / self.lot_size)
-            min_required_credit = width - (MAX_PERMITTED_SPREAD_RISK_INR / float(self.lot_size))
-            dynamic_min_credit = max(MIN_NET_CREDIT_PTS, round(min_required_credit, 2))
+        # 3. Safe OTM credit spread pricing (delta 0.15 - 0.25, targeting 10-16 pts credit)
+        # OTM Short leg price ~ 25.0 pts, OTM Hedge leg price ~ 12.0 pts => Net credit ~ 13.0 pts
+        target_credit = 13.0
+        sell_prem = 25.0
+        buy_prem = round(sell_prem - target_credit, 2)
+        net_credit = round(sell_prem - buy_prem, 2)
 
-            sell_prem = 75.0
-            # Target credit with comfortable buffer:
-            # If lot_size == 25, 18.0 pts credit yields 800 INR risk.
-            # If lot_size >= 65, dynamic_min_credit + 0.5 ensures risk is safely <= 1500 INR.
-            target_credit = max(18.0, round(dynamic_min_credit + 0.5, 1))
-            if target_credit > 30.0 or target_credit >= sell_prem:
-                continue
+        # 4. Defined Stop-Loss Exit Rule:
+        # Strictly capped at: entry_credit * 2.0 (or max 20 pts adverse excursion)
+        stop_loss_pts = round(min(net_credit * 2.0, MAX_STOP_LOSS_PTS), 2)
+        stop_loss_risk_inr = round(stop_loss_pts * self.lot_size, 2)
 
-            buy_prem = round(sell_prem - target_credit, 2)
-            net_credit = round(sell_prem - buy_prem, 2)
-            risk_inr = round((width * self.lot_size) - (net_credit * self.lot_size), 2)
+        # Catastrophic unhedged failure risk
+        catastrophic_risk_inr = round((chosen_width * self.lot_size) - (net_credit * self.lot_size), 2)
 
-            # Must satisfy both risk ceiling and minimum credit capture threshold
-            if risk_inr <= MAX_PERMITTED_SPREAD_RISK_INR and net_credit >= MIN_NET_CREDIT_PTS:
-                chosen_width = width
-                chosen_net_credit = net_credit
-                chosen_max_risk_inr = risk_inr
-                break
-            else:
-                self.logger.warning(
-                    f"[RISK ADAPTATION] Width {width} pts yields Max Risk INR {risk_inr:.2f} (Credit: {net_credit:.1f} pts, "
-                    f"Min Needed: {dynamic_min_credit:.1f} pts). Evaluating next width..."
-                )
-
-        # If candidate breaches the 1500 INR ceiling or lacks minimum credit, REJECT the trade formulation
-        if chosen_width is None:
+        # Invariant check: Defined stop-loss risk must strictly be <= 1500 INR and net_credit >= MIN_NET_CREDIT_PTS
+        if stop_loss_risk_inr > MAX_PERMITTED_SPREAD_RISK_INR or not (net_credit >= MIN_NET_CREDIT_PTS):
             self.logger.error(
-                f"[TRADE FORMULATION REJECTED] Cannot construct defined-risk spread satisfying "
-                f"risk <= INR {MAX_PERMITTED_SPREAD_RISK_INR:.2f} and credit >= {MIN_NET_CREDIT_PTS} pts. "
-                f"Trade proposal aborted."
+                f"[TRADE FORMULATION REJECTED] Stop-loss risk INR {stop_loss_risk_inr:.2f} > INR {MAX_PERMITTED_SPREAD_RISK_INR:.2f} "
+                f"or credit {net_credit:.1f} < {MIN_NET_CREDIT_PTS} pts. Trade aborted."
             )
             return
 
+        chosen_net_credit = net_credit
+        chosen_max_risk_inr = stop_loss_risk_inr
+
+        # 5. Strike selection: Safe OTM credit spreads (e.g. 1 strike OTM away from spot)
         if signal_type_str == SignalType.BULLISH_REJECTION.value:
-            # Bull Put Spread: Buy Put @ atm_strike - chosen_width (Hedge first), Sell Put @ atm_strike
-            sell_strike = atm_strike
+            # Bull Put Spread: Sell OTM Put (atm_strike - 50), Buy Hedge Put (sell_strike - width)
+            sell_strike = atm_strike - 50.0
             buy_strike = sell_strike - chosen_width
-            sell_prem = 75.0
-            buy_prem = sell_prem - chosen_net_credit
 
             # Margin requirement invariant: BUY leg MUST precede SELL leg
             legs = [
@@ -142,11 +128,9 @@ class CoderAgent(BaseAgent):
             spread_type = SpreadType.BULL_PUT_SPREAD.value
 
         elif signal_type_str == SignalType.BEARISH_REJECTION.value:
-            # Bear Call Spread: Buy Call @ atm_strike + chosen_width (Hedge first), Sell Call @ atm_strike
-            sell_strike = atm_strike
+            # Bear Call Spread: Sell OTM Call (atm_strike + 50), Buy Hedge Call (sell_strike + width)
+            sell_strike = atm_strike + 50.0
             buy_strike = sell_strike + chosen_width
-            sell_prem = 75.0
-            buy_prem = sell_prem - chosen_net_credit
 
             # Margin requirement invariant: BUY leg MUST precede SELL leg
             legs = [
@@ -183,15 +167,19 @@ class CoderAgent(BaseAgent):
             "spot_price": spot_price,
             "spread_width": chosen_width,
             "net_credit": chosen_net_credit,
-            "max_risk_inr": chosen_max_risk_inr,
+            "stop_loss_pts": stop_loss_pts,
+            "stop_loss_risk_inr": stop_loss_risk_inr,
+            "max_risk_inr": stop_loss_risk_inr,
+            "catastrophic_max_risk_inr": catastrophic_risk_inr,
             "max_reward_inr": max_reward_inr,
             "timestamp": ts,
-            "architect_signal": payload["description"],
+            "architect_signal": payload.get("description", ""),
         }
 
         self.logger.info(
             f"[PAYLOAD SYNTHESIZED] Proposed {spread_type} ({trade_id}) | "
-            f"Width: {chosen_width} pts | Max Risk: INR {chosen_max_risk_inr} <= INR {MAX_PERMITTED_SPREAD_RISK_INR} | "
+            f"Width: {chosen_width} pts | Credit: {chosen_net_credit} pts | "
+            f"Stop-Loss: {stop_loss_pts} pts (INR {stop_loss_risk_inr} <= {MAX_PERMITTED_SPREAD_RISK_INR}) | "
             f"Max Reward: INR {max_reward_inr}"
         )
 

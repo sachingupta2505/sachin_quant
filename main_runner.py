@@ -249,48 +249,33 @@ def coder_worker(
 
             # Dynamic strike calculation
             atm_strike = round(spot_price / 50.0) * 50.0
-            candidate_widths = [100.0, 50.0]
-            chosen_width = None
-            chosen_credit = 0.0
-            chosen_risk_inr = 0.0
-
-            for width in candidate_widths:
-                # Dynamic credit to guarantee (width - net_credit) * LOT_SIZE <= 1500 INR
-                min_req_credit = width - (MAX_PERMITTED_SPREAD_RISK_INR / float(LOT_SIZE))
-                dynamic_credit = max(10.0, round(min_req_credit, 2))
-                net_credit = max(dynamic_credit + 0.5, dynamic_credit)
-                sell_prem = 75.0
-                buy_prem = round(sell_prem - net_credit, 2)
-                net_credit = round(sell_prem - buy_prem, 2)
-                net_premium_received = net_credit * LOT_SIZE
-                risk_inr = (width * LOT_SIZE) - net_premium_received
-
-                if risk_inr <= MAX_PERMITTED_SPREAD_RISK_INR:
-                    chosen_width = width
-                    chosen_credit = net_credit
-                    chosen_risk_inr = round(risk_inr, 2)
-                    break
-
-            if chosen_width is None:
-                bus.update_status(ev.id, EventStatus.FAILED)
-                continue
+            # Safe OTM credit spread pricing (delta 0.15 - 0.25, targeting 10-16 pts credit)
+            chosen_width = 50.0
+            target_credit = 13.0
+            sell_prem = 25.0
+            buy_prem = round(sell_prem - target_credit, 2)
+            net_credit = round(sell_prem - buy_prem, 2)
+            stop_loss_pts = round(min(net_credit * 2.0, 20.0), 2)
+            stop_loss_risk_inr = round(stop_loss_pts * LOT_SIZE, 2)
+            chosen_credit = net_credit
+            chosen_risk_inr = stop_loss_risk_inr
 
             # Invariant: Margin order safety - BUY leg MUST precede SELL leg
             if signal_type == SignalType.BULLISH_REJECTION.value:
-                sell_strike = atm_strike
+                sell_strike = atm_strike - 50.0
                 buy_strike = sell_strike - chosen_width
                 spread_type = SpreadType.BULL_PUT_SPREAD.value
                 legs = [
-                    {"symbol": f"NIFTY_{int(buy_strike)}_PE", "strike": buy_strike, "option_type": "PE", "action": "BUY", "quantity": LOT_SIZE, "price": 75.0 - chosen_credit},
-                    {"symbol": f"NIFTY_{int(sell_strike)}_PE", "strike": sell_strike, "option_type": "PE", "action": "SELL", "quantity": LOT_SIZE, "price": 75.0},
+                    {"symbol": f"NIFTY_{int(buy_strike)}_PE", "strike": buy_strike, "option_type": "PE", "action": "BUY", "quantity": LOT_SIZE, "price": buy_prem},
+                    {"symbol": f"NIFTY_{int(sell_strike)}_PE", "strike": sell_strike, "option_type": "PE", "action": "SELL", "quantity": LOT_SIZE, "price": sell_prem},
                 ]
             else:
-                sell_strike = atm_strike
+                sell_strike = atm_strike + 50.0
                 buy_strike = sell_strike + chosen_width
                 spread_type = SpreadType.BEAR_CALL_SPREAD.value
                 legs = [
-                    {"symbol": f"NIFTY_{int(buy_strike)}_CE", "strike": buy_strike, "option_type": "CE", "action": "BUY", "quantity": LOT_SIZE, "price": 75.0 - chosen_credit},
-                    {"symbol": f"NIFTY_{int(sell_strike)}_CE", "strike": sell_strike, "option_type": "CE", "action": "SELL", "quantity": LOT_SIZE, "price": 75.0},
+                    {"symbol": f"NIFTY_{int(buy_strike)}_CE", "strike": buy_strike, "option_type": "CE", "action": "BUY", "quantity": LOT_SIZE, "price": buy_prem},
+                    {"symbol": f"NIFTY_{int(sell_strike)}_CE", "strike": sell_strike, "option_type": "CE", "action": "SELL", "quantity": LOT_SIZE, "price": sell_prem},
                 ]
 
             trade_id = f"SPD-{datetime.now(IST).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4].upper()}"
@@ -303,6 +288,8 @@ def coder_worker(
                 "spot_price": spot_price,
                 "spread_width": chosen_width,
                 "net_credit": chosen_credit,
+                "stop_loss_pts": stop_loss_pts,
+                "stop_loss_risk_inr": stop_loss_risk_inr,
                 "max_risk_inr": chosen_risk_inr,
                 "max_reward_inr": max_reward_inr,
                 "timestamp": ts_str,
@@ -318,7 +305,7 @@ def coder_worker(
             bus.update_status(ev.id, EventStatus.COMPLETED)
             logger.info(
                 f"[CODER] Created spread {spread_type} ({trade_id}) | "
-                f"Width: {chosen_width} pts | Max Risk: INR {chosen_risk_inr} <= {MAX_PERMITTED_SPREAD_RISK_INR} -> Auditor"
+                f"Width: {chosen_width} pts | Stop-Loss Risk: INR {chosen_risk_inr} <= {MAX_PERMITTED_SPREAD_RISK_INR} -> Auditor"
             )
 
             if verified_events and "coder_created_spread" in verified_events:
@@ -337,7 +324,7 @@ def auditor_worker(
     """
     Auditor Agent Worker:
     Consumes ORDER_PROPOSED events from Blackboard.
-    Validates hard risk invariants (Max Risk <= 1500 INR, Daily Trades < 2, Daily Loss > -1500 INR).
+    Validates hard risk invariants (Stop-Loss Defined Risk <= 1500 INR, Daily Trades < 2, Daily Loss > -1500 INR).
     Publishes ORDER_APPROVED to DevOps.
     """
     risk_guard = RiskGuard(state_file=state_file, tz=IST)
@@ -350,12 +337,20 @@ def auditor_worker(
             trade_id = payload["trade_id"]
             ts = datetime.fromisoformat(payload["timestamp"]) if "timestamp" in payload else datetime.now(IST)
 
-            # Invariant 1: Single spread risk <= 1500 INR
-            max_risk_inr = float(payload.get("max_risk_inr", 0.0))
-            if max_risk_inr > MAX_PERMITTED_SPREAD_RISK_INR:
+            # Expiry Day Guard: Freeze fresh entries after 12:30 IST on expiry days
+            is_expiry = ts.weekday() in (1, 3)
+            if is_expiry and ts.time() >= time(12, 30):
                 bus.update_status(ev.id, EventStatus.VETOED)
-                logger.warning(f"[AUDITOR] Vetoed {trade_id}: Max risk INR {max_risk_inr} > 1500 INR")
-                bus.publish(topic="ORDER_BLOCKED", source="Auditor", target="Notifier", payload={"trade_id": trade_id, "reason": f"Max risk INR {max_risk_inr} > 1500 INR"})
+                logger.warning(f"[AUDITOR] Vetoed {trade_id}: Expiry Day Guard: Fresh entries frozen after 12:30 IST")
+                bus.publish(topic="ORDER_BLOCKED", source="Auditor", target="Notifier", payload={"trade_id": trade_id, "reason": "Expiry day cutoff: frozen after 12:30 IST"})
+                continue
+
+            # Invariant 1: Single spread stop-loss risk <= 1500 INR
+            stop_loss_risk_inr = float(payload.get("stop_loss_risk_inr", payload.get("max_risk_inr", 0.0)))
+            if stop_loss_risk_inr > MAX_PERMITTED_SPREAD_RISK_INR:
+                bus.update_status(ev.id, EventStatus.VETOED)
+                logger.warning(f"[AUDITOR] Vetoed {trade_id}: Stop-loss risk INR {stop_loss_risk_inr} > 1500 INR")
+                bus.publish(topic="ORDER_BLOCKED", source="Auditor", target="Notifier", payload={"trade_id": trade_id, "reason": f"Stop-loss risk INR {stop_loss_risk_inr} > 1500 INR"})
                 continue
 
             # Invariant 2: Daily loss limit

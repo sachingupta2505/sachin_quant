@@ -39,9 +39,9 @@ def test_spread_dynamic_width_reduction_under_1500_inr():
     # Spread width must have been dynamically reduced from 150 to 50
     assert payload["spread_width"] == 50.0
     assert payload["max_risk_inr"] <= 1500.0
-    calculated_risk = (payload["spread_width"] * 65) - (payload["net_credit"] * 65)
-    assert calculated_risk <= 1500.0
-    assert payload["max_risk_inr"] == round(calculated_risk, 2)
+    assert payload["stop_loss_risk_inr"] <= 1500.0
+    assert payload["stop_loss_pts"] <= 20.0
+    assert payload["net_credit"] >= 10.0
 
 
 def test_spread_rejection_when_cannot_meet_1500_inr():
@@ -90,7 +90,8 @@ def test_bear_call_spread_respects_1500_inr_max_risk():
     assert payload["spread_type"] == SpreadType.BEAR_CALL_SPREAD.value
     assert payload["spread_width"] <= 50.0
     assert payload["max_risk_inr"] <= 1500.0
-    assert (payload["spread_width"] * 65) - (payload["net_credit"] * 65) <= 1500.0
+    assert payload["stop_loss_risk_inr"] <= 1500.0
+    assert payload["stop_loss_pts"] <= 20.0
 
 
 def test_comprehensive_spot_and_strike_sweep_never_exceeds_1500_inr():

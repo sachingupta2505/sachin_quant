@@ -16,13 +16,14 @@ Responsibilities:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, time
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from agents.base import AgentMessage, BaseAgent, MessageType
 from audit_logger import AuditLogger
 from risk_guard import RiskGuard, RiskState
+from agents.architect import is_expiry_day
 
 IST = ZoneInfo("Asia/Kolkata")
 MAX_DAILY_LOSS_INR: float = -1500.0  # Hard daily loss kill-switch in INR
@@ -51,6 +52,10 @@ class AuditorAgent(BaseAgent):
         elif message.msg_type == MessageType.POSITION_CLOSED:
             self.on_position_closed(message.payload)
 
+    def on_proposed_order(self, payload: dict) -> None:
+        """Alias for audit_proposed_order."""
+        self.audit_proposed_order(payload)
+
     def audit_proposed_order(self, payload: dict) -> None:
         trade_id = payload["trade_id"]
         ts = payload.get("timestamp") or datetime.now(self.tz)
@@ -74,33 +79,36 @@ class AuditorAgent(BaseAgent):
                     self.dispatch_fn(veto_msg)
                 return
 
-        # Recalculate single-trade maximum loss with multiplier 65
-        if len(legs) >= 2:
-            buy_leg = next((l for l in legs if l.get("action") == "BUY"), legs[0])
-            sell_leg = next((l for l in legs if l.get("action") == "SELL"), legs[1])
-            qty = int(buy_leg.get("quantity", 65))
-            spread_width = abs(float(buy_leg.get("strike", 0)) - float(sell_leg.get("strike", 0)))
-            net_credit = float(payload.get("net_credit", 0.0))
-            calculated_risk = round((spread_width * qty) - (net_credit * qty), 2)
-            if calculated_risk > 1500.0:
-                reason = f"Calculated max risk INR {calculated_risk:.2f} (multiplier {qty}) exceeds limit of INR 1500.0"
-                self.logger.warning(f"[AUDIT VETO] Order {trade_id} REJECTED! Reason: {reason}")
-                if self.dispatch_fn:
-                    veto_msg = AgentMessage(
-                        msg_id=f"REJ-{uuid.uuid4().hex[:6].upper()}",
-                        sender=self.name,
-                        recipient="Coder",
-                        msg_type=MessageType.AUDIT_REJECTED,
-                        payload={"trade_id": trade_id, "reason": reason, "timestamp": ts},
-                        timestamp=ts,
-                    )
-                    self.dispatch_fn(veto_msg)
-                return
+        # Expiry Day Guard: Freeze fresh entries after 12:30 IST on expiry days
+        if is_expiry_day(ts) and ts.time() >= time(12, 30):
+            reason = f"Expiry Day Guard: Fresh entries frozen after 12:30 IST on expiry day (attempted at {ts.strftime('%H:%M:%S')})"
+            self.logger.warning(f"[AUDIT VETO] Order {trade_id} REJECTED! Reason: {reason}")
+            if self.dispatch_fn:
+                veto_msg = AgentMessage(
+                    msg_id=f"REJ-{uuid.uuid4().hex[:6].upper()}",
+                    sender=self.name,
+                    recipient="Coder",
+                    msg_type=MessageType.AUDIT_REJECTED,
+                    payload={"trade_id": trade_id, "reason": reason, "timestamp": ts},
+                    timestamp=ts,
+                )
+                self.dispatch_fn(veto_msg)
+            return
 
-        # 1. Enforce hard single-spread risk ceiling <= INR 1500
-        max_risk_inr = float(payload.get("max_risk_inr", 0.0))
-        if max_risk_inr > 1500.0:
-            reason = f"Proposed max risk INR {max_risk_inr:.2f} exceeds hard limit of INR 1500.0"
+        # 1. Enforce Defined Stop-Loss Risk Ceiling <= INR 1500
+        # Stop loss on spread is strictly capped at entry_credit * 2.0 (or max 20 pts adverse excursion)
+        net_credit = float(payload.get("net_credit", 0.0))
+        stop_loss_pts = float(payload.get("stop_loss_pts", 0.0))
+        if stop_loss_pts <= 0.0 and net_credit > 0.0:
+            stop_loss_pts = min(net_credit * 2.0, 20.0)
+
+        qty = int(legs[0].get("quantity", 65)) if legs else 65
+        stop_loss_risk = float(payload.get("stop_loss_risk_inr") or round(stop_loss_pts * qty, 2))
+        stated_risk = float(payload.get("max_risk_inr", stop_loss_risk))
+        effective_risk = stop_loss_risk if stop_loss_risk > 0 else stated_risk
+
+        if effective_risk > 1500.0:
+            reason = f"Defined stop-loss risk INR {effective_risk:.2f} (stop {stop_loss_pts:.1f} pts, multiplier {qty}) exceeds limit of INR 1500.0"
             self.logger.warning(f"[AUDIT VETO] Order {trade_id} REJECTED! Reason: {reason}")
             if self.dispatch_fn:
                 veto_msg = AgentMessage(
@@ -218,6 +226,23 @@ class AuditorAgent(BaseAgent):
         """Audits live mark-to-market ticks against MAE/MFE and kill-switch."""
         now = current_time or datetime.now(self.tz)
         mae, mfe = self.audit_logger.update_m2m(trade_id, m2m_pnl)
+
+        # Expiry Day Mandatory Square-Off check (>= 13:30 IST on expiry days)
+        if is_expiry_day(now) and now.time() >= time(13, 30):
+            self.logger.warning(
+                f"[EXPIRY MANDATORY SQUARE-OFF] Square-off mandated post-13:30 IST on expiry day for {trade_id}!"
+            )
+            if self.dispatch_fn:
+                alert = AgentMessage(
+                    msg_id=f"SQO-{uuid.uuid4().hex[:6].upper()}",
+                    sender=self.name,
+                    recipient="DevOps",
+                    msg_type=MessageType.SQUARE_OFF_ALERT,
+                    payload={"trade_id": trade_id, "reason": "EXPIRY_MANDATORY_SQUARE_OFF_1330", "timestamp": now},
+                    timestamp=now,
+                )
+                self.dispatch_fn(alert)
+            return
 
         # Update FSM with live M2M
         state = self.risk_guard.update_unrealized_pnl(m2m_pnl, current_time=now)

@@ -254,7 +254,7 @@ def test_coder_agent_spread_max_risk_1500_ceiling():
     assert len(dispatched_messages) == 1
     proposed = dispatched_messages[0].payload
     assert proposed["max_risk_inr"] <= 1500.0
-    assert (proposed["spread_width"] * 65) - (proposed["net_credit"] * 65) <= 1500.0
+    assert proposed["stop_loss_risk_inr"] <= 1300.0
 
     # Test 2: Oversized/invalid lot size (75) where quantity is not a multiple of 65
     # CoderAgent MUST reject trade formulation and NOT dispatch any order

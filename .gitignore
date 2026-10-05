@@ -24,6 +24,8 @@ logs/
 *.db-shm
 algo_engine.log
 daily_state.json
+dry_run_state.json
+daily_reference_levels.json
 system_state.json
 reports/
 all_code.txt

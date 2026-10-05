@@ -215,7 +215,11 @@ def test_architect_agent_emits_signal_at_daily_support():
     rejection_candle = make_candle(10, 0, open_p=24995.0, high_p=25000.0, low_p=24945.0, close_p=24990.0)
     architect.on_candle(rejection_candle)
 
-    # Assert that Architect detected rejection and dispatched a strategy signal
+    # 4. Feed subsequent confirmation candle (10:05 IST) crossing above rejection high 25000
+    confirm_candle = make_candle(10, 5, open_p=24992.0, high_p=25010.0, low_p=24985.0, close_p=25005.0)
+    architect.on_candle(confirm_candle)
+
+    # Assert that Architect detected rejection and dispatched a strategy signal upon confirmation
     assert len(dispatched) >= 1
     signal_msg = dispatched[-1]
     assert signal_msg.msg_type == MessageType.STRATEGY_SIGNAL

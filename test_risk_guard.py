@@ -149,11 +149,12 @@ def test_kill_switch_unrealized_m2m_loss(temp_state_file: Path, base_date: datet
 
 
 def test_state_persistence_crash_recovery(temp_state_file: Path, base_date: datetime):
-    # Simulate first process run
+    # Simulate first process run using today's calendar date so state is active
+    today = datetime.now(IST).date()
+    t_time = datetime(today.year, today.month, today.day, 10, 5, tzinfo=IST)
     rg1 = RiskGuard(state_file=temp_state_file)
-    t_time = datetime(2026, 10, 5, 10, 5, tzinfo=IST)
     rg1.record_trade_entry("TRADE-CRASH-TEST", {"strategy": "spread"}, current_time=t_time)
-    rg1.record_trade_exit("TRADE-CRASH-TEST", realized_pnl=-450.0, current_time=datetime(2026, 10, 5, 10, 25, tzinfo=IST))
+    rg1.record_trade_exit("TRADE-CRASH-TEST", realized_pnl=-450.0, current_time=t_time.replace(minute=25))
 
     assert temp_state_file.exists()
 
@@ -166,7 +167,7 @@ def test_state_persistence_crash_recovery(temp_state_file: Path, base_date: date
     assert rg2._data.trades[0]["status"] == "CLOSED"
 
     # Verify next trade count correctly increments from restored state
-    next_time = datetime(2026, 10, 5, 11, 0, tzinfo=IST)
+    next_time = t_time.replace(minute=30)
     assert rg2.can_enter_trade(next_time)[0] is True
     rg2.record_trade_entry("TRADE-002", current_time=next_time)
     assert rg2.trade_count == 2

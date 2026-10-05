@@ -30,6 +30,8 @@ WINDOW_START_TIME: time = time(9, 45)      # 09:45 AM IST - Entry window opens
 WINDOW_END_TIME: time = time(15, 5)        # 03:05 PM IST - No new entries after this
 SQUARE_OFF_TIME: time = time(15, 10)       # 03:10 PM IST - Mandatory square-off
 MARKET_CLOSE_TIME: time = time(15, 30)     # 03:30 PM IST - Market close
+EXPIRY_ENTRY_CUTOFF_TIME: time = time(12, 30)  # 12:30 PM IST - Freeze fresh entries on expiry days
+EXPIRY_SQUARE_OFF_TIME: time = time(13, 30)    # 01:30 PM IST - Mandatory square-off on expiry days
 
 
 class RiskState(str, Enum):
@@ -213,7 +215,14 @@ class RiskGuard:
             self._atomic_save()
             return self._data.state
 
-        # 3. Mandatory Square-off trigger (>= 15:10)
+        # 3. Mandatory Square-off trigger (>= 13:30 on expiry days, >= 15:10 on normal days)
+        is_expiry = now.weekday() in (1, 3)
+        if is_expiry and now_time >= EXPIRY_SQUARE_OFF_TIME:
+            self._data.square_off_triggered = True
+            self._data.state = RiskState.SQUARE_OFF_TRIGGERED
+            self._atomic_save()
+            return self._data.state
+
         if now_time >= SQUARE_OFF_TIME:
             self._data.square_off_triggered = True
             self._data.state = RiskState.SQUARE_OFF_TRIGGERED
@@ -233,8 +242,9 @@ class RiskGuard:
             self._atomic_save()
             return self._data.state
 
-        # 6. Entry window gating (09:45 AM - 03:05 PM)
-        if WINDOW_START_TIME <= now_time < WINDOW_END_TIME:
+        # 6. Entry window gating (09:45 AM - 03:05 PM on normal days, 09:45 AM - 12:30 PM on expiry days)
+        effective_window_end = EXPIRY_ENTRY_CUTOFF_TIME if is_expiry else WINDOW_END_TIME
+        if WINDOW_START_TIME <= now_time < effective_window_end:
             self._data.state = RiskState.READY
         else:
             self._data.state = RiskState.IDLE
@@ -250,6 +260,7 @@ class RiskGuard:
         state = self.evaluate_fsm(current_time)
         now = self.get_current_time(current_time)
         now_time = now.time()
+        is_expiry = now.weekday() in (1, 3)
 
         if self._data.kill_switch_triggered:
             return False, f"Kill-switch active ({self._data.kill_switch_reason})"
@@ -262,6 +273,9 @@ class RiskGuard:
 
         if now_time < WINDOW_START_TIME:
             return False, f"Before trading window start ({WINDOW_START_TIME.strftime('%H:%M')} IST)"
+
+        if is_expiry and now_time >= EXPIRY_ENTRY_CUTOFF_TIME:
+            return False, f"Expiry day entry cutoff: no new entries after {EXPIRY_ENTRY_CUTOFF_TIME.strftime('%H:%M')} IST"
 
         if now_time >= WINDOW_END_TIME:
             return False, f"Trading entry window closed at {WINDOW_END_TIME.strftime('%H:%M')} IST"
