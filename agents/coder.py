@@ -74,10 +74,19 @@ class CoderAgent(BaseAgent):
         # Use standard 50 pt spread width for high-probability OTM credit
         chosen_width = candidate_widths[-1] if candidate_widths else 50.0
 
-        # 3. Safe OTM credit spread pricing (delta 0.15 - 0.25, targeting 10-16 pts credit)
-        # OTM Short leg price ~ 25.0 pts, OTM Hedge leg price ~ 12.0 pts => Net credit ~ 13.0 pts
-        target_credit = 13.0
-        sell_prem = 25.0
+        # 3. Credit spread pricing with physical risk ceiling <= 1500 INR:
+        # In a 50-pt spread with 65 lot size, physical max loss = (width - credit) * 65.
+        # To mathematically guarantee physical catastrophic risk <= 1500 INR:
+        # (50.0 - 27.0) * 65 = 1495.0 INR <= 1500.0 INR (requires minimum credit of >= 27.0 pts).
+        required_min_credit = max(
+            MIN_NET_CREDIT_PTS,
+            round(chosen_width - (MAX_PERMITTED_SPREAD_RISK_INR / self.lot_size), 2),
+        )
+        if chosen_width <= 50.0 and self.lot_size == 65:
+            required_min_credit = max(required_min_credit, 27.0)
+
+        target_credit = required_min_credit
+        sell_prem = round(target_credit + 11.0, 2)
         buy_prem = round(sell_prem - target_credit, 2)
         net_credit = round(sell_prem - buy_prem, 2)
 
@@ -89,11 +98,11 @@ class CoderAgent(BaseAgent):
         # Catastrophic unhedged failure risk
         catastrophic_risk_inr = round((chosen_width * self.lot_size) - (net_credit * self.lot_size), 2)
 
-        # Invariant check: Defined stop-loss risk must strictly be <= 1500 INR and net_credit >= MIN_NET_CREDIT_PTS
-        if stop_loss_risk_inr > MAX_PERMITTED_SPREAD_RISK_INR or not (net_credit >= MIN_NET_CREDIT_PTS):
+        # Invariant check: Defined stop-loss risk must strictly be <= 1500 INR and net_credit >= MIN_NET_CREDIT_PTS and net_credit >= required_min_credit
+        if stop_loss_risk_inr > MAX_PERMITTED_SPREAD_RISK_INR or not (net_credit >= MIN_NET_CREDIT_PTS) or net_credit < required_min_credit:
             self.logger.error(
                 f"[TRADE FORMULATION REJECTED] Stop-loss risk INR {stop_loss_risk_inr:.2f} > INR {MAX_PERMITTED_SPREAD_RISK_INR:.2f} "
-                f"or credit {net_credit:.1f} < {MIN_NET_CREDIT_PTS} pts. Trade aborted."
+                f"or credit {net_credit:.1f} < {required_min_credit} pts. Trade aborted."
             )
             return
 

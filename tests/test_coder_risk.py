@@ -118,3 +118,75 @@ def test_comprehensive_spot_and_strike_sweep_never_exceeds_1500_inr():
             assert len(dispatched) == 1
             payload = dispatched[0].payload
             assert payload["max_risk_inr"] <= 1500.0, f"Breached for spot {spot}"
+
+
+def test_auditor_spread_width_minimum_credit_27_pts_invariant(tmp_path):
+    """
+    If physical max loss (spread_width - credit) * lot_size > 1500 INR,
+    AuditorAgent must reject the trade if credit < 27.0 pts, and approve when credit >= 27.0 pts.
+    """
+    from agents.auditor import AuditorAgent
+    from agents.base import AgentMessage, MessageType
+
+    dispatched = []
+
+    def mock_dispatch(msg):
+        dispatched.append(msg)
+
+    auditor = AuditorAgent(
+        dispatch_fn=mock_dispatch,
+        state_file=str(tmp_path / "aud_state.json"),
+        db_path=str(tmp_path / "aud_db.db"),
+    )
+
+    # 1. 50-pt spread with low credit 15.0 pts: (50 - 15) * 65 = 2275 INR > 1500 INR -> REJECTED
+    msg_low_credit = AgentMessage(
+        msg_id="AUD-PROP-001",
+        sender="Coder",
+        recipient="Auditor",
+        msg_type=MessageType.PROPOSED_ORDER,
+        payload={
+            "trade_id": "TRADE-PHYSICAL-RISK-HIGH",
+            "spread_type": "BULL_PUT_SPREAD",
+            "spread_width": 50.0,
+            "net_credit": 15.0,
+            "stop_loss_pts": 15.0,
+            "stop_loss_risk_inr": 975.0,
+            "max_risk_inr": 975.0,
+            "legs": [
+                {"action": "BUY", "quantity": 65, "price": 10.0},
+                {"action": "SELL", "quantity": 65, "price": 25.0},
+            ],
+            "timestamp": datetime(2026, 10, 5, 10, 15, tzinfo=IST),
+        },
+    )
+    auditor.handle_message(msg_low_credit)
+    assert len(dispatched) == 1
+    assert dispatched[0].msg_type == MessageType.AUDIT_REJECTED
+    assert "Minimum required credit is >= 27.0 pts" in dispatched[0].payload["reason"]
+
+    # 2. 50-pt spread with compliant credit >= 27.0 pts: (50 - 27) * 65 = 1495 INR <= 1500 INR -> APPROVED
+    dispatched.clear()
+    msg_compliant_credit = AgentMessage(
+        msg_id="AUD-PROP-002",
+        sender="Coder",
+        recipient="Auditor",
+        msg_type=MessageType.PROPOSED_ORDER,
+        payload={
+            "trade_id": "TRADE-PHYSICAL-RISK-COMPLIANT",
+            "spread_type": "BULL_PUT_SPREAD",
+            "spread_width": 50.0,
+            "net_credit": 27.0,
+            "stop_loss_pts": 20.0,
+            "stop_loss_risk_inr": 1300.0,
+            "max_risk_inr": 1300.0,
+            "legs": [
+                {"action": "BUY", "quantity": 65, "price": 11.0},
+                {"action": "SELL", "quantity": 65, "price": 38.0},
+            ],
+            "timestamp": datetime(2026, 10, 5, 10, 20, tzinfo=IST),
+        },
+    )
+    auditor.handle_message(msg_compliant_credit)
+    assert len(dispatched) == 1
+    assert dispatched[0].msg_type == MessageType.AUDIT_APPROVED

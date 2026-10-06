@@ -439,10 +439,10 @@ class IndependentAnalyst:
                 "trade_id": "STRESS-FLASH-GAP-02",
                 "spread_type": "BULL_PUT_SPREAD",
                 "legs": [
-                    {"action": "BUY", "quantity": 65, "strike": 24900.0, "price": 12.0},
-                    {"action": "SELL", "quantity": 65, "strike": 24950.0, "price": 25.0},
+                    {"action": "BUY", "quantity": 65, "strike": 24900.0, "price": 11.0},
+                    {"action": "SELL", "quantity": 65, "strike": 24950.0, "price": 38.0},
                 ],
-                "net_credit": 13.0,
+                "net_credit": 27.0,
                 "stop_loss_pts": 20.0,
                 "stop_loss_risk_inr": 1300.0,
                 "max_risk_inr": 1300.0,

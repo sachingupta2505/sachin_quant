@@ -766,17 +766,19 @@ class ExecutionEngine:
                         except Exception:
                             pass
 
-                        # Fire immediate emergency MARKET square-off for BUY hedge leg
+                        # Fire aggressive limit square-off for BUY hedge leg: max(0.05, current_best_bid - 0.50)
+                        current_best_bid = float(buy_leg.price)
+                        limit_price = round(max(0.05, current_best_bid - 0.50), 2)
                         sq_params = {
                             "variety": "NORMAL",
                             "tradingsymbol": buy_sym,
                             "symboltoken": buy_tok,
                             "transactiontype": "SELL",
                             "exchange": "NFO",
-                            "ordertype": "MARKET",
+                            "ordertype": "LIMIT",
                             "producttype": "INTRADAY",
                             "duration": "DAY",
-                            "price": "0",
+                            "price": str(limit_price),
                             "quantity": str(buy_leg.quantity),
                         }
                         try:

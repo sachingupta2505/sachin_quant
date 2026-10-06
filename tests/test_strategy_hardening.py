@@ -63,7 +63,7 @@ def test_otm_spread_pricing_and_stop_loss_risk_math():
     # OTM spread verification
     assert payload["spread_type"] == SpreadType.BULL_PUT_SPREAD.value
     assert payload["spread_width"] == 50.0
-    assert 10.0 <= payload["net_credit"] <= 16.0
+    assert payload["net_credit"] >= 27.0
 
     # Stop loss definition
     expected_stop_pts = round(min(payload["net_credit"] * 2.0, 20.0), 2)
@@ -93,15 +93,15 @@ def test_auditor_approves_defined_stop_loss_under_1500_and_rejects_over():
 
     auditor = AuditorAgent(dispatch_fn=mock_dispatch)
 
-    # Valid spread with 20 pt stop on 65 lot = 1300 INR <= 1500 INR
+    # Valid spread with 20 pt stop on 65 lot = 1300 INR <= 1500 INR and >= 27.0 credit
     valid_payload = {
         "trade_id": "SPD-TEST-SAFE",
         "spread_type": "BULL_PUT_SPREAD",
         "legs": [
-            {"action": "BUY", "quantity": 65, "strike": 24900.0, "price": 12.0},
-            {"action": "SELL", "quantity": 65, "strike": 24950.0, "price": 25.0},
+            {"action": "BUY", "quantity": 65, "strike": 24900.0, "price": 11.0},
+            {"action": "SELL", "quantity": 65, "strike": 24950.0, "price": 38.0},
         ],
-        "net_credit": 13.0,
+        "net_credit": 27.0,
         "stop_loss_pts": 20.0,
         "stop_loss_risk_inr": 1300.0,
         "max_risk_inr": 1300.0,

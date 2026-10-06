@@ -86,6 +86,8 @@ def test_devops_2_leg_unfill_timeout_triggers_emergency_square_off():
     assert sq_order["action"] == "SELL"  # Square off BUY position
     assert sq_order["quantity"] == 65
     assert sq_order["reason"] == "EMERGENCY_SQUARE_OFF"
+    assert sq_order["ordertype"] == "LIMIT"
+    assert sq_order["price"] == round(max(0.05, 47.5 - 0.50), 2)
 
     # 3. Critical audit event must be dispatched to Auditor
     assert len(dispatched_messages) == 1
@@ -157,7 +159,8 @@ def test_execution_engine_2_leg_fill_timeout_and_square_off(tmp_path):
     assert mock_smart_api.placeOrder.call_count == 3
     sq_call = mock_smart_api.placeOrder.call_args_list[2][0][0]
     assert sq_call["transactiontype"] == "SELL"
-    assert sq_call["ordertype"] == "MARKET"
+    assert sq_call["ordertype"] == "LIMIT"
+    assert sq_call["price"] == str(round(max(0.05, 47.5 - 0.50), 2))
     assert sq_call["quantity"] == "65"
 
 

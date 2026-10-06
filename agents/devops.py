@@ -29,7 +29,7 @@ IST = ZoneInfo("Asia/Kolkata")
 
 # Microstructure & Order Safety Invariants
 DEFAULT_ORDER_TYPE: str = "LIMIT"          # Disallow unconstrained MARKET orders to prevent slippage
-EMERGENCY_ORDER_TYPE: str = "MARKET"       # Used exclusively for immediate emergency unfill square-off
+EMERGENCY_ORDER_TYPE: str = "LIMIT"        # Aggressive limit order to prevent massive market slippage
 MAX_BID_ASK_SPREAD_RATIO: float = 0.10     # Max 10% bid-ask spread relative to mid-price
 
 
@@ -158,10 +158,13 @@ class DevOpsAgent(BaseAgent):
 
             # Leg 2: SELL short leg times out (> 5.0s)
             # 1. Immediately CANCEL pending SELL limit order (simulated)
-            # 2. Fire immediate emergency MARKET square-off for BUY hedge leg
+            # 2. Fire immediate aggressive LIMIT square-off for BUY hedge leg: max(0.05, current_best_bid - 0.50)
+            current_best_bid = float(buy_leg.get("price", 10.0))
+            limit_price = round(max(0.05, current_best_bid - 0.50), 2)
             sq_order = {
                 "action": "SELL",
                 "ordertype": EMERGENCY_ORDER_TYPE,
+                "price": limit_price,
                 "tradingsymbol": tradingsymbol,
                 "symboltoken": symboltoken,
                 "quantity": buy_leg["quantity"],
@@ -305,6 +308,16 @@ class DevOpsAgent(BaseAgent):
         sell_oid = data_sell.get("orderid") if isinstance(data_sell, dict) else None
         if not resp_sell or not resp_sell.get("status") or not sell_oid:
             # If placing SELL leg failed immediately or returned no orderid, square off BUY leg
+            current_best_bid = float(buy.get("price", 10.0))
+            if self.auth and self.auth.smart_api:
+                try:
+                    resp_bid = self.auth.smart_api.ltpData("NFO", sym_buy, tok_buy)
+                    if resp_bid and resp_bid.get("status") and resp_bid.get("data"):
+                        current_best_bid = float(resp_bid["data"].get("ltp", current_best_bid))
+                except Exception:
+                    pass
+            limit_price = round(max(0.05, current_best_bid - 0.50), 2)
+
             sq_params = {
                 "variety": "NORMAL",
                 "tradingsymbol": sym_buy,
@@ -314,7 +327,7 @@ class DevOpsAgent(BaseAgent):
                 "ordertype": EMERGENCY_ORDER_TYPE,
                 "producttype": "INTRADAY",
                 "duration": "DAY",
-                "price": "0",
+                "price": str(limit_price),
                 "quantity": str(buy["quantity"]),
             }
             try:
@@ -335,7 +348,17 @@ class DevOpsAgent(BaseAgent):
             except Exception:
                 pass
 
-            # 2. Fire immediate emergency MARKET square-off for BUY hedge leg
+            # 2. Fire aggressive limit square-off for BUY hedge leg: max(0.05, current_best_bid - 0.50)
+            current_best_bid = float(buy.get("price", 10.0))
+            if self.auth and self.auth.smart_api:
+                try:
+                    resp_bid = self.auth.smart_api.ltpData("NFO", sym_buy, tok_buy)
+                    if resp_bid and resp_bid.get("status") and resp_bid.get("data"):
+                        current_best_bid = float(resp_bid["data"].get("ltp", current_best_bid))
+                except Exception:
+                    pass
+            limit_price = round(max(0.05, current_best_bid - 0.50), 2)
+
             sq_params = {
                 "variety": "NORMAL",
                 "tradingsymbol": sym_buy,
@@ -345,7 +368,7 @@ class DevOpsAgent(BaseAgent):
                 "ordertype": EMERGENCY_ORDER_TYPE,
                 "producttype": "INTRADAY",
                 "duration": "DAY",
-                "price": "0",
+                "price": str(limit_price),
                 "quantity": str(buy["quantity"]),
             }
             try:

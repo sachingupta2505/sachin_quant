@@ -194,3 +194,43 @@ def test_corrupted_state_file_graceful_recovery(temp_state_file: Path):
     rg = RiskGuard(state_file=temp_state_file)
     assert rg.trade_count == 0
     assert rg.realized_pnl == 0.0
+
+
+def test_dynamic_expiry_session_and_wednesday_contract_logic(temp_state_file: Path):
+    """
+    Verifies is_expiry_session evaluates dynamic contract dates:
+    1. Standard Wednesday (2026-10-07) without dynamic contract is NOT an expiry day.
+    2. When a dynamic Wednesday contract expiry is present (e.g. Bank Nifty or shifted holiday expiry),
+       is_expiry_session recognizes it as an expiry session.
+    3. Normal expiry day timing gates (12:30 entry freeze, 13:30 square-off) apply dynamically.
+    """
+    from datetime import date
+    from risk_guard import is_expiry_session
+
+    wednesday_dt = datetime(2026, 10, 7, 11, 0, tzinfo=IST)
+    wednesday_date = date(2026, 10, 7)
+
+    # 1. Without dynamic contract, standard Wednesday is not an expiry day
+    assert is_expiry_session(wednesday_date, custom_expiries=[]) is False
+
+    # 2. With dynamic contract expiring on Wednesday, it is recognized as an expiry session
+    assert is_expiry_session(wednesday_date, custom_expiries=["2026-10-07"]) is True
+    assert is_expiry_session(wednesday_dt, custom_expiries=[wednesday_date]) is True
+
+    # 3. Dynamic Wednesday expiry triggers 12:30 entry cutoff and 13:30 square-off in RiskGuard
+    rg_wed = RiskGuard(
+        state_file=temp_state_file,
+        custom_expiries=["2026-10-07"],
+    )
+    assert rg_wed.is_expiry_session(wednesday_dt) is True
+
+    # At 12:35 on Wednesday with dynamic contract, entry is blocked
+    wed_after_cutoff = datetime(2026, 10, 7, 12, 35, tzinfo=IST)
+    allowed, reason = rg_wed.can_enter_trade(wed_after_cutoff)
+    assert allowed is False
+    assert "Expiry day entry cutoff" in reason
+
+    # At 13:35 on Wednesday with dynamic contract, mandatory square-off is triggered
+    wed_square_off = datetime(2026, 10, 7, 13, 35, tzinfo=IST)
+    state = rg_wed.evaluate_fsm(wed_square_off)
+    assert state == RiskState.SQUARE_OFF_TRIGGERED

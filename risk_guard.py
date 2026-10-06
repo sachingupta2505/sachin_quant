@@ -13,7 +13,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, time
+from datetime import date, datetime, time
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -32,6 +32,58 @@ SQUARE_OFF_TIME: time = time(15, 10)       # 03:10 PM IST - Mandatory square-off
 MARKET_CLOSE_TIME: time = time(15, 30)     # 03:30 PM IST - Market close
 EXPIRY_ENTRY_CUTOFF_TIME: time = time(12, 30)  # 12:30 PM IST - Freeze fresh entries on expiry days
 EXPIRY_SQUARE_OFF_TIME: time = time(13, 30)    # 01:30 PM IST - Mandatory square-off on expiry days
+
+
+def is_expiry_session(
+    target_dt: Optional[Union[datetime, date, str]] = None,
+    custom_expiries: Optional[Any] = None,
+    token_resolver: Optional[Any] = None,
+) -> bool:
+    """
+    Evaluates whether a target session date is an active contract expiry date.
+    Evaluates dynamic contract expiry dates from NFOTokenResolver / nfo_instruments.json
+    rather than a rigid hardcoded weekday check.
+    """
+    if target_dt is None:
+        target_date = datetime.now(IST).date()
+    elif isinstance(target_dt, datetime):
+        target_date = target_dt.astimezone(IST).date() if target_dt.tzinfo else target_dt.date()
+    elif isinstance(target_dt, date):
+        target_date = target_dt
+    elif isinstance(target_dt, str):
+        try:
+            target_date = datetime.strptime(target_dt[:10], "%Y-%m-%d").date()
+        except ValueError:
+            target_date = datetime.now(IST).date()
+    else:
+        target_date = datetime.now(IST).date()
+
+    # 1. Custom or injected dynamic expiry dates (e.g. Wednesday BankNifty or shifted holiday expiry)
+    if custom_expiries:
+        for exp in custom_expiries:
+            if isinstance(exp, date) and exp == target_date:
+                return True
+            elif isinstance(exp, str):
+                try:
+                    from nfo_token_resolver import parse_expiry_date
+                    exp_d = parse_expiry_date(exp)
+                    if exp_d == target_date:
+                        return True
+                except Exception:
+                    pass
+
+    # 2. Dynamic contract expiry dates from NFOTokenResolver / nfo_instruments.json
+    try:
+        from nfo_token_resolver import NFOTokenResolver
+        resolver = token_resolver or NFOTokenResolver(auto_load=True)
+        active_expiries = resolver.get_active_expiry_dates()
+        if active_expiries and target_date in active_expiries:
+            return True
+    except Exception:
+        pass
+
+    # 3. Standard exchange weekly derivatives schedule fallback (Tuesdays/Thursdays)
+    return target_date.weekday() in (1, 3)
 
 
 class RiskState(str, Enum):
@@ -72,10 +124,26 @@ class RiskGuard:
     Finite State Machine and risk guard enforcing trading rules and persistence.
     """
 
-    def __init__(self, state_file: str | Path = "daily_state.json", tz: ZoneInfo = IST):
+    def __init__(
+        self,
+        state_file: str | Path = "daily_state.json",
+        tz: ZoneInfo = IST,
+        token_resolver: Optional[Any] = None,
+        custom_expiries: Optional[Any] = None,
+    ):
         self.state_file = Path(state_file)
         self.tz = tz
+        self.token_resolver = token_resolver
+        self.custom_expiries = custom_expiries
         self._data: DailyRiskState = self._load_or_initialize()
+
+    def is_expiry_session(self, current_time: Optional[Union[datetime, date]] = None) -> bool:
+        """Determines if the session is an active expiry session using dynamic contract evaluation."""
+        return is_expiry_session(
+            target_dt=current_time or self.get_current_time(),
+            custom_expiries=self.custom_expiries,
+            token_resolver=self.token_resolver,
+        )
 
     @property
     def current_state(self) -> RiskState:
@@ -216,7 +284,7 @@ class RiskGuard:
             return self._data.state
 
         # 3. Mandatory Square-off trigger (>= 13:30 on expiry days, >= 15:10 on normal days)
-        is_expiry = now.weekday() in (1, 3)
+        is_expiry = self.is_expiry_session(now)
         if is_expiry and now_time >= EXPIRY_SQUARE_OFF_TIME:
             self._data.square_off_triggered = True
             self._data.state = RiskState.SQUARE_OFF_TRIGGERED
@@ -260,7 +328,7 @@ class RiskGuard:
         state = self.evaluate_fsm(current_time)
         now = self.get_current_time(current_time)
         now_time = now.time()
-        is_expiry = now.weekday() in (1, 3)
+        is_expiry = self.is_expiry_session(now)
 
         if self._data.kill_switch_triggered:
             return False, f"Kill-switch active ({self._data.kill_switch_reason})"

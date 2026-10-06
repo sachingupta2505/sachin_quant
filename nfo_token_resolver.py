@@ -237,6 +237,19 @@ class NFOTokenResolver:
         for pair_key in self._strike_options:
             self._strike_options[pair_key].sort(key=lambda x: x[0])
 
+    def get_active_expiry_dates(self) -> List[date]:
+        """Returns sorted list of all active unique expiry dates across cached instruments."""
+        expiries: set[date] = set()
+        for candidates in self._strike_options.values():
+            for exp_d, _, _, _ in candidates:
+                expiries.add(exp_d)
+        if not expiries and self._instruments:
+            for item in self._instruments:
+                d = parse_expiry_date(item.get("expiry"))
+                if d:
+                    expiries.add(d)
+        return sorted(list(expiries))
+
     def resolve_token(
         self,
         symbol: str = "NIFTY",

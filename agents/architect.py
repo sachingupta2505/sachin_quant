@@ -33,8 +33,9 @@ MAX_INDIA_VIX: float = 24.0                   # Volatility expansion limit: halt
 
 
 def is_expiry_day(dt: datetime) -> bool:
-    """NSE Nifty weekly options contracts expire on Tuesdays (weekday 1) or Thursdays (weekday 3)."""
-    return dt.weekday() in (1, 3)
+    """Evaluates whether dt is an active expiry session using dynamic contract evaluation."""
+    from risk_guard import is_expiry_session
+    return is_expiry_session(dt)
 
 
 class ArchitectAgent(BaseAgent):

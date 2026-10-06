@@ -122,6 +122,30 @@ class AuditorAgent(BaseAgent):
                 self.dispatch_fn(veto_msg)
             return
 
+        # Physical Spread Width Risk Invariant Check:
+        # In a 50-point spread with 65 lot size, physical max loss can reach (50 - Credit) * 65.
+        # If (spread_width - min_credit) * lot_size > MAX_TRADE_RISK (1500 INR),
+        # the proposal must either require minimum credit >= 27.0 pts or be rejected outright before routing to DevOps.
+        spread_width = float(payload.get("spread_width", 50.0))
+        physical_spread_risk = round((spread_width - net_credit) * qty, 2)
+        if physical_spread_risk > 1500.0 and net_credit < 27.0:
+            reason = (
+                f"Physical spread risk breach: ({spread_width} - {net_credit:.2f}) * {qty} = "
+                f"INR {physical_spread_risk:.2f} > INR 1500.0 limit. Minimum required credit is >= 27.0 pts."
+            )
+            self.logger.warning(f"[AUDIT VETO] Order {trade_id} REJECTED! Reason: {reason}")
+            if self.dispatch_fn:
+                veto_msg = AgentMessage(
+                    msg_id=f"REJ-{uuid.uuid4().hex[:6].upper()}",
+                    sender=self.name,
+                    recipient="Coder",
+                    msg_type=MessageType.AUDIT_REJECTED,
+                    payload={"trade_id": trade_id, "reason": reason, "timestamp": ts},
+                    timestamp=ts,
+                )
+                self.dispatch_fn(veto_msg)
+            return
+
         # 2. Hard daily loss limit invariant check (rejects if daily PnL <= -1500.0 INR)
         if self.risk_guard.total_pnl <= MAX_DAILY_LOSS_INR:
             reason = f"Hard daily loss limit breached: total PnL ₹{self.risk_guard.total_pnl:.2f} <= ₹{MAX_DAILY_LOSS_INR:.2f}"
