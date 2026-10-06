@@ -340,6 +340,8 @@ class MasterExecutiveAgent:
         - Runs full invariant checks (agents/overseer.py --audit) for zero regression.
         """
         today_str = target_date or datetime.now(IST).strftime("%Y-%m-%d")
+        # Ensure any open positions in the SQLite journal are squared off and reconciled
+        self.audit_logger.reconcile_and_close_open_positions(notes=f"EOD Settlement {today_str}")
         daily_perf = self.audit_logger.get_daily_performance(today_str)
 
         # 1. Expectancy & Invariant Calculations
@@ -559,7 +561,9 @@ class MasterExecutiveAgent:
 
                 # Time Gate: 15:10 IST Square-Off
                 if current_time >= dtime(15, 10):
-                    self.send_gated_alert("SQUARE_OFF", "🔒 All Positions Auto Squared-Off")
+                    closed = self.audit_logger.reconcile_and_close_open_positions(notes="15:10 IST Auto Square-Off")
+                    msg = f"🔒 All Positions Auto Squared-Off ({len(closed)} closed)" if closed else "🔒 All Positions Auto Squared-Off"
+                    self.send_gated_alert("SQUARE_OFF", msg)
 
                 # Time Gate: 15:30 IST Post-Market Close & Evolution Trigger
                 if current_time >= dtime(15, 30):

@@ -410,6 +410,15 @@ def auditor_worker(
             bus.update_status(ev.id, EventStatus.COMPLETED)
             logger.info(f"[AUDITOR] Trade {trade_id} journaled to SQLite (Paper Mode: {payload.get('is_paper', True)})")
 
+        # Also consume square-off events to reconcile any open positions in SQLite journal
+        sq_events = bus.consume(topic="POSITIONS_SQUARED_OFF", target="Auditor")
+        sq_events.extend(bus.consume(topic="SQUARE_OFF_ALERT", target="Auditor"))
+        for ev in sq_events:
+            closed = audit_logger.reconcile_and_close_open_positions(notes="Square-Off Bus Event")
+            bus.update_status(ev.id, EventStatus.COMPLETED)
+            if closed:
+                logger.info(f"[AUDITOR] Auto-closed {len(closed)} open position(s) upon square-off alert")
+
         time.sleep(0.05)
 
 
@@ -592,12 +601,15 @@ def run_dry_run(db_path: str = "system_bus.db") -> bool:
     logger.info("Initializing concurrent thread test harness over bus.py...")
 
     dry_run_state = "dry_run_state.json"
+    dry_run_journal = "test_journal.db"
     state_path = Path(dry_run_state)
-    if state_path.exists():
-        try:
-            state_path.unlink()
-        except OSError:
-            pass
+    journal_path = Path(dry_run_journal)
+    for p in (state_path, journal_path):
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
     bus = SystemBus(db_path=db_path)
     with bus._get_connection() as conn:
@@ -627,7 +639,7 @@ def run_dry_run(db_path: str = "system_bus.db") -> bool:
         ),
         threading.Thread(
             target=auditor_worker,
-            args=(SystemBus(db_path=db_path), stop_event, verified_events, dry_run_state),
+            args=(SystemBus(db_path=db_path), stop_event, verified_events, dry_run_state, dry_run_journal),
             name="AuditorWorker",
             daemon=True,
         ),
@@ -690,11 +702,16 @@ def run_dry_run(db_path: str = "system_bus.db") -> bool:
     for t in threads:
         t.join(timeout=1.0)
 
-    if state_path.exists():
-        try:
-            state_path.unlink()
-        except OSError:
-            pass
+    # Reconcile test trade and clean up isolated test journal
+    dry_run_audit = AuditLogger(db_path=dry_run_journal, tz=IST)
+    dry_run_audit.reconcile_and_close_open_positions(notes="Dry-run Verification Auto-Exit")
+
+    for p in (state_path, journal_path):
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
     print("\n" + "=" * 80)
     print("[SUCCESS] All 4 agents communicated cleanly via bus.py")
@@ -919,24 +936,33 @@ def run_live_market(
                 time.sleep(min(15.0, poll_interval * 5))
                 continue
 
-            # 15:10 IST: Auto Square-off Alert
+            # 15:10 IST: Auto Square-off Alert & Position Reconciliation
             if current_time >= dtime(15, 10) and not square_off_alert_sent:
                 square_off_alert_sent = True
+                audit_logger_sq = AuditLogger(tz=IST)
+                closed_trades = audit_logger_sq.reconcile_and_close_open_positions(notes="15:10 IST Auto Square-Off")
                 bus.publish(
                     topic="POSITIONS_SQUARED_OFF",
                     source="RiskGuard",
                     target="Notifier",
-                    payload={"message": "All Positions Auto Squared-Off"},
+                    payload={
+                        "message": f"All Positions Auto Squared-Off ({len(closed_trades)} closed)",
+                        "closed_count": len(closed_trades),
+                    },
                 )
+                logger.info(f"[15:10 SQUARE-OFF] Auto-closed {len(closed_trades)} open positions in trading journal.")
 
             # Post-market shutdown (after 15:30)
             if current_time > dtime(15, 30) and max_ticks is None:
                 logger.info(f"[MARKET CLOSE] Current time is {now.strftime('%H:%M:%S')} IST. Regular market closed.")
+                audit_logger_eod = AuditLogger(tz=IST)
+                audit_logger_eod.reconcile_and_close_open_positions(notes="15:30 IST Market Close Square-Off")
+                eod_perf = audit_logger_eod.get_daily_performance()
                 bus.publish(
                     topic="EOD_SUMMARY",
                     source="AuditLogger",
                     target="Notifier",
-                    payload={"count": tick_count, "pnl": 0.0},
+                    payload={"count": eod_perf["trade_count"], "pnl": eod_perf["total_net_pnl"]},
                 )
                 break
 
