@@ -11,6 +11,6 @@ if exist ".venv\Scripts\activate" (
     call ".venv\Scripts\activate.bat"
 )
 
-python -m agents.post_market_ai_chief >> "logs\post_market_%DATE%.log" 2>&1
+python scripts\post_market_eod.py >> "logs\post_market_%DATE%.log" 2>&1
 
 endlocal

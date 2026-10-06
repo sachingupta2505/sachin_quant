@@ -16,8 +16,13 @@ from fee_calculator import IndianRegulatoryFeeCalculator
 
 @pytest.fixture
 def temp_journal(tmp_path: Path) -> Path:
-    db_file = tmp_path / "test_journal.db"
-    return db_file
+    db_file = tmp_path / "isolated_test_journal.db"
+    yield db_file
+    if db_file.exists():
+        try:
+            db_file.unlink()
+        except Exception:
+            pass
 
 
 def test_reconcile_and_close_open_positions(temp_journal: Path):

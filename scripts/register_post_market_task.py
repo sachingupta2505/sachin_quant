@@ -37,7 +37,7 @@ def ensure_post_market_batch_script() -> str:
         ') else if exist ".venv\\Scripts\\activate.bat" (\n'
         '    call ".venv\\Scripts\\activate.bat"\n'
         ")\n\n"
-        'python -m agents.post_market_ai_chief >> "logs\\post_market_%DATE%.log" 2>&1\n\n'
+        'python scripts\\post_market_eod.py >> "logs\\post_market_%DATE%.log" 2>&1\n\n'
         "endlocal\n"
     )
     with open(BAT_SCRIPT, "w", encoding="utf-8") as f:

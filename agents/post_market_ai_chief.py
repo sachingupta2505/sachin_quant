@@ -176,108 +176,13 @@ def tool_fetch_market_levels(symbol_token: str = "99926000") -> str:
     Ingests NIFTY 50 EOD data from Angel One SmartAPI or cache, computes PDH, PDL, PDC,
     PWH, PWL, and 14-period ATR, and returns JSON structure.
     """
-    now = datetime.now(IST)
-    today_date = now.date()
-
-    # Attempt fetching via SmartAPI if credentials exist
-    raw_candles = []
-    smart_api = None
     try:
-        from main_runner import AngelAuth
-        api_key = os.getenv("SMARTAPI_API_KEY")
-        client_code = os.getenv("SMARTAPI_CLIENT_CODE")
-        pin = os.getenv("SMARTAPI_PIN")
-        totp = os.getenv("SMARTAPI_TOTP_SECRET")
-        if api_key and client_code:
-            auth = AngelAuth(api_key=api_key, client_code=client_code, pin=pin, totp_secret=totp)
-            if auth.login() and auth.smart_api:
-                smart_api = auth.smart_api
-                from_date = (now - timedelta(days=45)).strftime("%Y-%m-%d 09:15")
-                to_date = now.strftime("%Y-%m-%d 15:30")
-                resp = smart_api.getCandleData({
-                    "exchange": "NSE",
-                    "symboltoken": str(symbol_token),
-                    "interval": "ONE_DAY",
-                    "fromdate": from_date,
-                    "todate": to_date,
-                })
-                if resp and isinstance(resp, dict) and resp.get("status") and resp.get("data"):
-                    raw_candles = resp["data"]
+        from scripts.calculate_next_levels import calculate_levels
+        levels = calculate_levels()
+        return json.dumps(levels, indent=2)
     except Exception as e:
-        logger.warning(f"SmartAPI historical candle fetch fallback: {e}")
-
-    parsed_candles = []
-    if raw_candles:
-        for c in raw_candles:
-            if not c or len(c) < 5:
-                continue
-            try:
-                c_date = datetime.strptime(str(c[0])[:10], "%Y-%m-%d").date()
-                parsed_candles.append({
-                    "date": c_date,
-                    "open": float(c[1]),
-                    "high": float(c[2]),
-                    "low": float(c[3]),
-                    "close": float(c[4]),
-                })
-            except Exception:
-                continue
-
-    # Fallback to realistic current market range around ~25000 Nifty
-    if len(parsed_candles) >= 2:
-        last_day = parsed_candles[-1]
-        pdh = round(last_day["high"], 2)
-        pdl = round(last_day["low"], 2)
-        pdc = round(last_day["close"], 2)
-
-        # 14-period ATR
-        trs = []
-        for i in range(1, len(parsed_candles)):
-            prev_close = parsed_candles[i - 1]["close"]
-            h = parsed_candles[i]["high"]
-            l = parsed_candles[i]["low"]
-            tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
-            trs.append(tr)
-        atr_14 = round(sum(trs[-14:]) / min(len(trs), 14), 2) if trs else 195.0
-
-        # PWH and PWL
-        cur_monday = today_date - timedelta(days=today_date.weekday())
-        prev_monday = cur_monday - timedelta(days=7)
-        prev_week_candles = [c for c in parsed_candles if prev_monday <= c["date"] < cur_monday] or parsed_candles[-5:]
-        pwh = round(max(c["high"] for c in prev_week_candles), 2)
-        pwl = round(min(c["low"] for c in prev_week_candles), 2)
-    else:
-        # High-fidelity baseline around current spot 25000
-        base_spot = 25015.0
-        pdh = 25140.0
-        pdl = 24890.0
-        pdc = 25010.0
-        pwh = 25280.0
-        pwl = 24780.0
-        atr_14 = 192.5
-
-    next_date = today_date + timedelta(days=1)
-    if next_date.weekday() == 5:  # Saturday -> Monday
-        next_date += timedelta(days=2)
-    elif next_date.weekday() == 6:  # Sunday -> Monday
-        next_date += timedelta(days=1)
-
-    levels_data = {
-        "date": today_date.isoformat(),
-        "next_session_date": next_date.isoformat(),
-        "pdh": pdh,
-        "pdl": pdl,
-        "pdc": pdc,
-        "pwh": pwh,
-        "pwl": pwl,
-        "atr_14": atr_14,
-        "daily": {"pdh": pdh, "pdl": pdl, "pdc": pdc},
-        "weekly": {"pwh": pwh, "pwl": pwl},
-        "atr": atr_14,
-        "calculated_at": now.isoformat(),
-        "status": "ARMED",
-    }
-    return json.dumps(levels_data, indent=2)
+        logger.error(f"Error calculating levels: {e}")
+        return json.dumps({"error": str(e)})
 
 
 def tool_arm_system_state() -> str:
@@ -535,6 +440,9 @@ class PostMarketAIChief:
         briefing_path = f"reports/eod_briefing_{self.target_date}.md"
         logger.info(f"[THOUGHT 11] Generating institutional Markdown briefing at '{briefing_path}'...")
 
+        exec_count = daily_perf.get("total_trades", 0)
+        exec_status_note = "No trades executed; capital preserved 100%." if exec_count == 0 else f"{exec_count} trade(s) executed."
+
         briefing_md = f"""# SachinQuant Post-Market AI Chief Executive Briefing
 **Session Date:** {self.target_date} | **Generated At:** {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')} IST
 **Trigger Mode:** Autonomous 16:00 IST Agentic Loop | **Status:** SYSTEM ARMED FOR NEXT SESSION
@@ -543,12 +451,12 @@ class PostMarketAIChief:
 
 ## 1. Executive Summary & Session Performance
 * **Session Classification:** {self.target_date} (Tuesday Weekly 0DTE Expiry)
-* **Total Trades Executed:** {daily_perf.get('total_trades', 1)} (Closed: {daily_perf.get('closed_trades', 1)}, Open: 0)
-* **Gross PnL:** INR +{daily_perf.get('total_gross_pnl', 845.0):,.2f}
-* **Statutory Regulatory Friction:** INR -{daily_perf.get('total_charges', 50.22):,.2f} (STT 0.1%, Brokerage ₹20/leg, GST 18%, Stamp Duty)
-* **Net Realized PnL:** **INR +{daily_perf.get('total_net_pnl', 794.78):,.2f}**
-* **Win Rate:** **{daily_perf.get('win_rate', 100.0):.1f}%** (1 Win / 0 Loss)
-* **Execution Slippage:** {daily_perf.get('avg_slippage', 0.0):.4f} pts (Zero adverse execution friction)
+* **Total Trades Executed:** {daily_perf.get('total_trades', 0)} (Closed: {daily_perf.get('closed_trades', 0)}, Open: {daily_perf.get('open_trades', 0)})
+* **Gross PnL:** INR {daily_perf.get('total_gross_pnl', 0.0):+,.2f}
+* **Statutory Regulatory Friction:** INR {daily_perf.get('total_charges', 0.0):,.2f} (STT 0.1%, Brokerage ₹20/leg, GST 18%, Stamp Duty)
+* **Net Realized PnL:** **INR {daily_perf.get('total_net_pnl', 0.0):+,.2f}**
+* **Win Rate:** **{daily_perf.get('win_rate', 0.0):.1f}%**
+* **Execution Slippage:** {daily_perf.get('avg_slippage', 0.0):.4f} pts
 
 ---
 
@@ -561,21 +469,20 @@ class PostMarketAIChief:
 ---
 
 ## 3. Market Regime & Strategy Post-Mortem
-* **Market Structure:** Initial Balance formed between 09:15-09:45 IST; price respected S1 support boundary at 24950.
-* **Bull Put Spread Execution:** Leg sequencing (BUY hedge first, SELL short second) executed with 0 margin rejects.
-* **Gamma Protection:** Expiry Day Guard halted fresh entries after 12:30 IST; spread held safely to EOD worthless expiry.
-* **Actionable Enhancement:** All rules adhered to mathematical invariants (Max Defined Risk <= INR 1,500.00).
+* **Market Structure:** Initial Balance formed between 09:15-09:45 IST.
+* **Execution Status:** {exec_status_note}
+* **Risk & Friction:** All rules adhered to mathematical invariants (Max Defined Risk <= INR 1,500.00).
 
 ---
 
 ## 4. Next-Session Reference Levels & System Arming
 * **Next Session Date:** {levels_data.get('next_session_date', 'Next Trading Day')}
-* **Previous Day High (PDH):** INR {levels_data.get('pdh', 25140.0):,.2f}
-* **Previous Day Low (PDL):** INR {levels_data.get('pdl', 24890.0):,.2f}
-* **Previous Day Close (PDC):** INR {levels_data.get('pdc', 25010.0):,.2f}
-* **Previous Week High (PWH):** INR {levels_data.get('pwh', 25280.0):,.2f}
-* **Previous Week Low (PWL):** INR {levels_data.get('pwl', 24780.0):,.2f}
-* **14-Period ATR:** {levels_data.get('atr_14', 192.5):.2f} pts
+* **Previous Day High (PDH):** INR {levels_data.get('pdh', 0.0):,.2f}
+* **Previous Day Low (PDL):** INR {levels_data.get('pdl', 0.0):,.2f}
+* **Previous Day Close (PDC):** INR {levels_data.get('pdc', 0.0):,.2f}
+* **Previous Week High (PWH):** INR {levels_data.get('pwh', 0.0):,.2f}
+* **Previous Week Low (PWL):** INR {levels_data.get('pwl', 0.0):,.2f}
+* **14-Period ATR:** {levels_data.get('atr_14', 0.0):.2f} pts
 * **Stored In:** [`data/next_session_levels.json`](file:///c:/sachin_quant/data/next_session_levels.json)
 * **Engine State:** `daily_state.json` reset to `ARMED_FOR_NEXT_SESSION` (trade_count = 0, pnl = 0.0).
 
