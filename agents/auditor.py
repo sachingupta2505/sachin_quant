@@ -126,9 +126,14 @@ class AuditorAgent(BaseAgent):
         # In a 50-point spread with 65 lot size, physical max loss can reach (50 - Credit) * 65.
         # If (spread_width - min_credit) * lot_size > MAX_TRADE_RISK (1500 INR),
         # the proposal must either require minimum credit >= 27.0 pts or be rejected outright before routing to DevOps.
-        spread_width = float(payload.get("spread_width", 50.0))
+        spread_width = float(payload.get("spread_width", 0.0))
+        if spread_width <= 0 and legs and len(legs) >= 2:
+            spread_width = abs(float(legs[0].get("strike", 0.0)) - float(legs[1].get("strike", 0.0)))
+        if spread_width <= 0:
+            spread_width = 50.0
+
         physical_spread_risk = round((spread_width - net_credit) * qty, 2)
-        if physical_spread_risk > 1500.0 and net_credit < 27.0:
+        if physical_spread_risk > 1500.0:
             reason = (
                 f"Physical spread risk breach: ({spread_width} - {net_credit:.2f}) * {qty} = "
                 f"INR {physical_spread_risk:.2f} > INR 1500.0 limit. Minimum required credit is >= 27.0 pts."

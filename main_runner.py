@@ -43,7 +43,7 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 from bus import EventStatus, SystemBus
 from execution_engine import AngelAuth, Candle, RejectionDetector, SignalType, SpreadType
 from regime_filter import InitialBalance, InitialBalanceTracker, MarketRegime, RegimeFilter
-from risk_guard import RiskGuard
+from risk_guard import RiskGuard, is_expiry_session
 from audit_logger import AuditLogger
 from agents.architect import EXPIRY_CUTOFF_TIME, is_expiry_day
 from agents.notifier import TelegramNotifier, notifier_worker
@@ -249,10 +249,18 @@ def coder_worker(
 
             # Dynamic strike calculation
             atm_strike = round(spot_price / 50.0) * 50.0
-            # Safe OTM credit spread pricing (delta 0.15 - 0.25, targeting 10-16 pts credit)
+            # Credit spread pricing with physical risk ceiling <= 1500 INR:
+            # (50.0 - 27.0) * 65 = 1495.0 INR <= 1500.0 INR (requires minimum credit of >= 27.0 pts)
             chosen_width = 50.0
-            target_credit = 13.0
-            sell_prem = 25.0
+            required_min_credit = max(
+                10.0,
+                round(chosen_width - (MAX_PERMITTED_SPREAD_RISK_INR / LOT_SIZE), 2),
+            )
+            if chosen_width <= 50.0 and LOT_SIZE == 65:
+                required_min_credit = max(required_min_credit, 27.0)
+
+            target_credit = required_min_credit
+            sell_prem = round(target_credit + 11.0, 2)
             buy_prem = round(sell_prem - target_credit, 2)
             net_credit = round(sell_prem - buy_prem, 2)
             stop_loss_pts = round(min(net_credit * 2.0, 20.0), 2)
@@ -337,8 +345,8 @@ def auditor_worker(
             trade_id = payload["trade_id"]
             ts = datetime.fromisoformat(payload["timestamp"]) if "timestamp" in payload else datetime.now(IST)
 
-            # Expiry Day Guard: Freeze fresh entries after 12:30 IST on expiry days
-            is_expiry = ts.weekday() in (1, 3)
+            # Expiry Day Guard: Freeze fresh entries after 12:30 IST on dynamic expiry sessions
+            is_expiry = is_expiry_session(ts)
             if is_expiry and ts.time() >= time(12, 30):
                 bus.update_status(ev.id, EventStatus.VETOED)
                 logger.warning(f"[AUDITOR] Vetoed {trade_id}: Expiry Day Guard: Fresh entries frozen after 12:30 IST")
@@ -351,6 +359,28 @@ def auditor_worker(
                 bus.update_status(ev.id, EventStatus.VETOED)
                 logger.warning(f"[AUDITOR] Vetoed {trade_id}: Stop-loss risk INR {stop_loss_risk_inr} > 1500 INR")
                 bus.publish(topic="ORDER_BLOCKED", source="Auditor", target="Notifier", payload={"trade_id": trade_id, "reason": f"Stop-loss risk INR {stop_loss_risk_inr} > 1500 INR"})
+                continue
+
+            # Invariant 1b: Physical spread width catastrophic risk ceiling <= 1500 INR
+            # In a 50-point spread with 65 lot size, physical max loss = (width - credit) * 65.
+            # (50 - 13) * 65 = INR 2,405 > 1500 INR. Must require credit >= 27.0 pts or veto outright.
+            spread_width = float(payload.get("spread_width", 0.0))
+            if spread_width <= 0 and "legs" in payload and len(payload["legs"]) >= 2:
+                spread_width = abs(float(payload["legs"][0].get("strike", 0.0)) - float(payload["legs"][1].get("strike", 0.0)))
+            if spread_width <= 0:
+                spread_width = 50.0
+
+            net_credit = float(payload.get("net_credit", 0.0))
+            qty = LOT_SIZE
+            physical_spread_risk = round((spread_width - net_credit) * qty, 2)
+            if physical_spread_risk > MAX_PERMITTED_SPREAD_RISK_INR:
+                bus.update_status(ev.id, EventStatus.VETOED)
+                logger.warning(
+                    f"[AUDITOR] Vetoed {trade_id}: Physical spread risk breach: "
+                    f"({spread_width} - {net_credit:.2f}) * {qty} = INR {physical_spread_risk:.2f} > 1500 INR limit. "
+                    f"Minimum required credit is >= 27.0 pts."
+                )
+                bus.publish(topic="ORDER_BLOCKED", source="Auditor", target="Notifier", payload={"trade_id": trade_id, "reason": f"Physical spread risk breach: INR {physical_spread_risk:.2f} > 1500 INR"})
                 continue
 
             # Invariant 2: Daily loss limit

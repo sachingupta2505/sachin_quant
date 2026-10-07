@@ -137,6 +137,10 @@ class InitialBalanceTracker:
             self._low = candle.low
         return True
 
+    def ingest_ib_candle(self, candle: Candle) -> bool:
+        """Alias for add_candle for compatibility with live feed worker."""
+        return self.add_candle(candle)
+
     def lock_manual(self) -> None:
         """Explicitly lock IB (e.g. at 09:45:00 mark)."""
         self._is_locked = True

@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -43,13 +44,20 @@ CACHE_FILE = ROOT_DIR / "data" / "nifty_daily_candles.json"
 OUTPUT_FILE = ROOT_DIR / "data" / "next_session_levels.json"
 
 
-def fetch_official_candles(symbol_token: str = "99926000") -> List[Dict[str, Any]]:
+def fetch_official_candles(symbol_token: str = "99926000", invalidate_cache: bool = False) -> List[Dict[str, Any]]:
     """
     Fetches official daily candles from Angel One SmartAPI.
     Saves to local cache and returns structured list of candles.
     """
     now = datetime.now(IST)
     candles_raw = []
+
+    if invalidate_cache and CACHE_FILE.exists():
+        logger.info(f"Invalidating stale local candle cache at {CACHE_FILE}...")
+        try:
+            CACHE_FILE.unlink()
+        except OSError:
+            pass
 
     try:
         from main_runner import AngelAuth
@@ -70,13 +78,23 @@ def fetch_official_candles(symbol_token: str = "99926000") -> List[Dict[str, Any
                     "fromdate": from_date,
                     "todate": to_date,
                 }
-                resp = auth.smart_api.getCandleData(payload)
-                if resp and isinstance(resp, dict) and resp.get("status") and resp.get("data"):
-                    candles_raw = resp["data"]
-                    logger.info(f"Fetched {len(candles_raw)} daily candles directly from Angel One SmartAPI.")
-                    # Persist to local cache for resilient offline parity
-                    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-                    CACHE_FILE.write_text(json.dumps(candles_raw, indent=2), encoding="utf-8")
+                # Retry loop with exponential backoff for rate limit protection
+                for attempt in range(1, 4):
+                    try:
+                        time.sleep(1.0)
+                        resp = auth.smart_api.getCandleData(payload)
+                        if resp and isinstance(resp, dict) and resp.get("status") and resp.get("data"):
+                            candles_raw = resp["data"]
+                            logger.info(f"Fetched {len(candles_raw)} daily candles directly from Angel One SmartAPI (attempt {attempt}).")
+                            # Persist to local cache for resilient offline parity
+                            CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                            CACHE_FILE.write_text(json.dumps(candles_raw, indent=2), encoding="utf-8")
+                            break
+                        else:
+                            logger.warning(f"SmartAPI getCandleData attempt {attempt} returned: {resp}")
+                    except Exception as attempt_err:
+                        logger.warning(f"SmartAPI getCandleData attempt {attempt} exception: {attempt_err}")
+                    time.sleep(1.5)
     except Exception as e:
         logger.warning(f"Angel One SmartAPI candle fetch exception: {e}")
 
@@ -110,11 +128,11 @@ def fetch_official_candles(symbol_token: str = "99926000") -> List[Dict[str, Any
     return parsed
 
 
-def calculate_levels(target_date_str: Optional[str] = None) -> Dict[str, Any]:
+def calculate_levels(target_date_str: Optional[str] = None, invalidate_cache: bool = True) -> Dict[str, Any]:
     """
     Computes mathematical technical anchors from official candles.
     """
-    candles = fetch_official_candles()
+    candles = fetch_official_candles(invalidate_cache=invalidate_cache)
     today_date = datetime.strptime(target_date_str, "%Y-%m-%d").date() if target_date_str else datetime.now(IST).date()
 
     # Find the candle for today or the latest available trading session
