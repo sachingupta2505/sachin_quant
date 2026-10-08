@@ -347,7 +347,7 @@ def auditor_worker(
 
             # Expiry Day Guard: Freeze fresh entries after 12:30 IST on dynamic expiry sessions
             is_expiry = is_expiry_session(ts)
-            if is_expiry and ts.time() >= time(12, 30):
+            if is_expiry and ts.time() >= dtime(12, 30):
                 bus.update_status(ev.id, EventStatus.VETOED)
                 logger.warning(f"[AUDITOR] Vetoed {trade_id}: Expiry Day Guard: Fresh entries frozen after 12:30 IST")
                 bus.publish(topic="ORDER_BLOCKED", source="Auditor", target="Notifier", payload={"trade_id": trade_id, "reason": "Expiry day cutoff: frozen after 12:30 IST"})
