@@ -16,13 +16,13 @@ Responsibilities:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, time
+from datetime import datetime, time as dtime
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from agents.base import AgentMessage, BaseAgent, MessageType
 from audit_logger import AuditLogger
-from risk_guard import RiskGuard, RiskState
+from risk_guard import RiskGuard, RiskState, validate_physical_spread_risk
 from agents.architect import is_expiry_day
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -80,7 +80,7 @@ class AuditorAgent(BaseAgent):
                 return
 
         # Expiry Day Guard: Freeze fresh entries after 12:30 IST on expiry days
-        if is_expiry_day(ts) and ts.time() >= time(12, 30):
+        if is_expiry_day(ts) and ts.time() >= dtime(12, 30):
             reason = f"Expiry Day Guard: Fresh entries frozen after 12:30 IST on expiry day (attempted at {ts.strftime('%H:%M:%S')})"
             self.logger.warning(f"[AUDIT VETO] Order {trade_id} REJECTED! Reason: {reason}")
             if self.dispatch_fn:
@@ -122,30 +122,28 @@ class AuditorAgent(BaseAgent):
                 self.dispatch_fn(veto_msg)
             return
 
-        # Physical Spread Width Risk Invariant Check:
-        # In a 50-point spread with 65 lot size, physical max loss can reach (50 - Credit) * 65.
-        # If (spread_width - min_credit) * lot_size > MAX_TRADE_RISK (1500 INR),
-        # the proposal must either require minimum credit >= 27.0 pts or be rejected outright before routing to DevOps.
+        # Physical Spread Width Risk Invariant Check (Single Source of Truth)
         spread_width = float(payload.get("spread_width", 0.0))
         if spread_width <= 0 and legs and len(legs) >= 2:
             spread_width = abs(float(legs[0].get("strike", 0.0)) - float(legs[1].get("strike", 0.0)))
         if spread_width <= 0:
             spread_width = 50.0
 
-        physical_spread_risk = round((spread_width - net_credit) * qty, 2)
-        if physical_spread_risk > 1500.0:
-            reason = (
-                f"Physical spread risk breach: ({spread_width} - {net_credit:.2f}) * {qty} = "
-                f"INR {physical_spread_risk:.2f} > INR 1500.0 limit. Minimum required credit is >= 27.0 pts."
-            )
-            self.logger.warning(f"[AUDIT VETO] Order {trade_id} REJECTED! Reason: {reason}")
+        is_valid_spread, physical_spread_risk, risk_reason = validate_physical_spread_risk(
+            spread_width=spread_width,
+            net_credit=net_credit,
+            lot_size=qty,
+            max_risk_inr=1500.0,
+        )
+        if not is_valid_spread:
+            self.logger.warning(f"[AUDIT VETO] Order {trade_id} REJECTED! Reason: {risk_reason}")
             if self.dispatch_fn:
                 veto_msg = AgentMessage(
                     msg_id=f"REJ-{uuid.uuid4().hex[:6].upper()}",
                     sender=self.name,
                     recipient="Coder",
                     msg_type=MessageType.AUDIT_REJECTED,
-                    payload={"trade_id": trade_id, "reason": reason, "timestamp": ts},
+                    payload={"trade_id": trade_id, "reason": risk_reason, "timestamp": ts},
                     timestamp=ts,
                 )
                 self.dispatch_fn(veto_msg)
@@ -257,7 +255,7 @@ class AuditorAgent(BaseAgent):
         mae, mfe = self.audit_logger.update_m2m(trade_id, m2m_pnl)
 
         # Expiry Day Mandatory Square-Off check (>= 13:30 IST on expiry days)
-        if is_expiry_day(now) and now.time() >= time(13, 30):
+        if is_expiry_day(now) and now.time() >= dtime(13, 30):
             self.logger.warning(
                 f"[EXPIRY MANDATORY SQUARE-OFF] Square-off mandated post-13:30 IST on expiry day for {trade_id}!"
             )

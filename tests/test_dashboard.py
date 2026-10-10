@@ -183,3 +183,74 @@ def test_dashboard_render_simulation(
     create_mock_journal_db(empty_db, populate_trades=False)
     render_ui(journal_db_path=empty_db)
     assert mock_info.called
+
+
+def test_session_date_filtering_and_zero_mock_fallback(tmp_path: Path):
+    """Verifies that date filtering strictly returns only that date's records and zero rows for empty dates."""
+    db_path = tmp_path / "journal_filtering.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE trade_journal (
+            trade_id TEXT PRIMARY KEY,
+            date TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            spread_type TEXT NOT NULL,
+            entry_time TEXT NOT NULL,
+            expected_entry_price REAL NOT NULL,
+            actual_entry_price REAL NOT NULL,
+            entry_slippage REAL NOT NULL,
+            exit_time TEXT,
+            expected_exit_price REAL,
+            actual_exit_price REAL,
+            exit_slippage REAL DEFAULT 0.0,
+            total_slippage REAL DEFAULT 0.0,
+            realized_pnl REAL DEFAULT 0.0,
+            mae_inr REAL DEFAULT 0.0,
+            mfe_inr REAL DEFAULT 0.0,
+            is_paper INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            notes TEXT,
+            gross_pnl REAL DEFAULT 0.0,
+            total_charges REAL DEFAULT 0.0,
+            net_pnl REAL DEFAULT 0.0
+        );
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO trade_journal VALUES (
+            'SPD-20261007-095502-B2E4', '2026-10-07', 'NIFTY', 'BEAR_CALL_SPREAD',
+            '2026-10-07T09:50:00+05:30', 13.0, 13.0, 0.0,
+            '2026-10-07T15:10:00+05:30', 0.0, 0.0, 0.0, 0.0,
+            794.78, 0.0, 794.78, 1, 'CLOSED',
+            'Bearish Rejection at IB_HIGH_RESISTANCE (22625.7)',
+            845.0, 50.22, 794.78
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    # 1. Query 2026-10-07 -> Exactly 1 trade
+    df_07 = load_trades_data(journal_db_path=db_path, target_date="2026-10-07")
+    assert len(df_07) == 1
+    assert df_07.iloc[0]["trade_id"] == "SPD-20261007-095502-B2E4"
+    assert df_07.iloc[0]["net_pnl"] == 794.78
+    assert df_07.iloc[0]["strikes"] == "22650 CE / 22700 CE"
+    assert "NIFTY Spread" not in df_07.iloc[0]["strikes"]
+    assert "24900" not in df_07.iloc[0]["strikes"]
+
+    # 2. Query 2026-10-08 -> Exactly 0 trades (NO fallback mock data)
+    df_08 = load_trades_data(journal_db_path=db_path, target_date="2026-10-08")
+    assert df_08.empty
+    kpis_08 = compute_kpis(df_08)
+    assert kpis_08["total_trades"] == 0
+    assert kpis_08["net_pnl"] == 0.0
+    assert kpis_08["win_rate"] == 0.0
+
+    # 3. Query All -> Exactly 1 trade
+    df_all = load_trades_data(journal_db_path=db_path, target_date=None)
+    assert len(df_all) == 1
+    assert df_all.iloc[0]["net_pnl"] == 794.78
+

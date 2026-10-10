@@ -12,15 +12,15 @@ Features:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import datetime, time as dtime
 from enum import Enum
 from typing import Optional, Sequence
 from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
 
-IB_START_TIME = time(9, 15)
-IB_END_TIME = time(9, 45)
+IB_START_TIME = dtime(9, 15)
+IB_END_TIME = dtime(9, 45)
 
 
 class MarketRegime(str, Enum):

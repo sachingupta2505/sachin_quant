@@ -65,6 +65,25 @@ class AuditLogger:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA busy_timeout = 5000;")
+
+        # Invariant: NO DELETE or DROP permitted on production trading_journal.db
+        prod_path = (Path(__file__).resolve().parent / "trading_journal.db").resolve()
+        try:
+            if self.db_path.resolve() == prod_path:
+                def _guard_authorizer(action, arg1, arg2, dbname, source):
+                    if action in (
+                        sqlite3.SQLITE_DELETE,
+                        sqlite3.SQLITE_DROP_TABLE,
+                        sqlite3.SQLITE_DROP_INDEX,
+                        sqlite3.SQLITE_DROP_VIEW,
+                    ):
+                        return sqlite3.SQLITE_DENY
+                    return sqlite3.SQLITE_OK
+
+                conn.set_authorizer(_guard_authorizer)
+        except Exception:
+            pass
+
         try:
             yield conn
         finally:

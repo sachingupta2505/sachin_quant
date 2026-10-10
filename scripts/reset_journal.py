@@ -32,6 +32,12 @@ SYSTEM_BUS = ROOT_DIR / "system_bus.db"
 
 def reset_trading_journal() -> tuple[int, int]:
     """Backs up trading_journal.db and clears trade_journal & execution_events tables."""
+    prod_path = (ROOT_DIR / "trading_journal.db").resolve()
+    if JOURNAL_DB.resolve() == prod_path:
+        raise PermissionError(
+            "INVARIANT VIOLATION: Execution of DELETE or DROP on production trading_journal.db is strictly forbidden."
+        )
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     rows_cleared = 0
 

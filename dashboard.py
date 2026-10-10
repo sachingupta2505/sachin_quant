@@ -31,22 +31,23 @@ import streamlit as st
 
 IST = ZoneInfo("Asia/Kolkata")
 ROOT_DIR = Path(__file__).resolve().parent
-DEFAULT_JOURNAL_DB = ROOT_DIR / "trading_journal.db"
-DEFAULT_BUS_DB = ROOT_DIR / "system_bus.db"
+DEFAULT_JOURNAL_DB = (ROOT_DIR / "trading_journal.db").resolve()
+DEFAULT_BUS_DB = (ROOT_DIR / "system_bus.db").resolve()
 
 
 def get_read_only_connection(db_path: Path) -> Optional[sqlite3.Connection]:
     """Establishes an ACID read-only connection with WAL pragma to avoid locking the live engine."""
-    if not db_path.exists():
+    resolved_path = Path(db_path).resolve()
+    if not resolved_path.exists():
         return None
     try:
-        conn = sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{resolved_path.as_posix()}?mode=ro", uri=True)
         conn.execute("PRAGMA query_only = ON;")
         conn.row_factory = sqlite3.Row
         return conn
     except Exception:
         try:
-            conn = sqlite3.connect(str(db_path))
+            conn = sqlite3.connect(str(resolved_path))
             conn.execute("PRAGMA query_only = ON;")
             conn.row_factory = sqlite3.Row
             return conn
@@ -87,12 +88,19 @@ def get_trade_strikes_map(bus_db_path: Path = DEFAULT_BUS_DB) -> Dict[str, str]:
     return strikes_map
 
 
+@st.cache_data(ttl=5, show_spinner=False)
 def load_trades_data(
     journal_db_path: Path = DEFAULT_JOURNAL_DB,
     bus_db_path: Path = DEFAULT_BUS_DB,
+    target_date: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Reads all trade records from trading_journal.db and enriches with strikes and formatting."""
-    conn = get_read_only_connection(journal_db_path)
+    """Reads genuine trade records from production trading_journal.db and enriches with strikes and formatting.
+    Zero mock/fallback data: if trading_journal.db has 0 rows for the queried filter, strictly returns empty DataFrame.
+    """
+    resolved_journal = Path(journal_db_path).resolve()
+    resolved_bus = Path(bus_db_path).resolve()
+
+    conn = get_read_only_connection(resolved_journal)
     if not conn:
         return pd.DataFrame()
 
@@ -103,37 +111,41 @@ def load_trades_data(
         if not cursor.fetchone():
             return pd.DataFrame()
 
-        df = pd.read_sql_query(
-            "SELECT * FROM trade_journal ORDER BY entry_time DESC",
-            conn,
-        )
+        if target_date and target_date != "ALL":
+            query = "SELECT * FROM trade_journal WHERE date = ? ORDER BY entry_time ASC"
+            df = pd.read_sql_query(query, conn, params=(target_date,))
+        else:
+            query = "SELECT * FROM trade_journal ORDER BY entry_time ASC"
+            df = pd.read_sql_query(query, conn)
     except Exception:
         return pd.DataFrame()
     finally:
         conn.close()
 
     if df.empty:
-        return df
+        return pd.DataFrame()
 
     # Enrich strikes from bus_events or notes
-    strikes_map = get_trade_strikes_map(bus_db_path)
+    strikes_map = get_trade_strikes_map(resolved_bus)
 
     def extract_strikes(row: pd.Series) -> str:
         tid = row.get("trade_id", "")
         if tid in strikes_map:
             return strikes_map[tid]
         notes = str(row.get("notes", ""))
+        spread_type = str(row.get("spread_type", ""))
         if "(" in notes and ")" in notes:
             try:
                 spot_sub = notes.split("(")[1].split(")")[0]
-                spot_val = int(float(spot_sub))
-                if "BULL_PUT" in str(row.get("spread_type", "")):
-                    return f"{spot_val - 50} PE / {spot_val} PE"
-                else:
-                    return f"{spot_val + 50} CE / {spot_val} CE"
+                spot_val = float(spot_sub)
+                base_strike = int(round(spot_val / 50.0) * 50)
+                if "BULL_PUT" in spread_type:
+                    return f"{base_strike - 50} PE / {base_strike} PE"
+                elif "BEAR_CALL" in spread_type:
+                    return f"{base_strike} CE / {base_strike + 50} CE"
             except Exception:
                 pass
-        return "NIFTY Spread"
+        return spread_type.replace("_", " ").title() if spread_type else "-"
 
     df["strikes"] = df.apply(extract_strikes, axis=1)
 
@@ -300,23 +312,54 @@ def render_ui(
 
     # Sidebar
     st.sidebar.title("⚡ Cockpit Controls")
+
+    # Date Filter: ["All Time" (default), "Today", "Custom Date"]
+    date_filter_options = ["All Time", "Today", "Custom Date"]
+    selected_filter = "All Time"
+    raw_filter = st.sidebar.selectbox(
+        "📅 Date Filter",
+        options=date_filter_options,
+        index=0,
+    )
+    if isinstance(raw_filter, str):
+        selected_filter = raw_filter
+
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    target_date_param: Optional[str] = None
+
+    if selected_filter == "All Time":
+        target_date_param = None
+    elif selected_filter == "Today":
+        target_date_param = today_str
+    elif selected_filter == "Custom Date":
+        try:
+            custom_d = st.sidebar.date_input(
+                "Select Custom Date",
+                value=datetime.now(IST).date(),
+            )
+            target_date_param = custom_d.strftime("%Y-%m-%d") if hasattr(custom_d, "strftime") else str(custom_d)
+        except Exception:
+            target_date_param = today_str
+
     auto_refresh = st.sidebar.checkbox("🔄 Auto-Refresh every 10s", value=False)
     if st.sidebar.button("🔁 Manual Refresh", use_container_width=True):
+        st.cache_data.clear()
         st.rerun()
 
     st.sidebar.markdown("---")
     st.sidebar.markdown(
-        """
+        f"""
         **System Specs:**
         - Engine: 4-Agent Autonomous
         - Broker: Angel One SmartAPI
+        - Database: `{Path(journal_db_path).resolve().name}`
         - Risk Guard: Max Loss ₹1,500/day
         - Strategy: 5m Wick Rejection
         """
     )
 
     # Load data & compute metrics
-    df = load_trades_data(journal_db_path, bus_db_path)
+    df = load_trades_data(journal_db_path, bus_db_path, target_date=target_date_param)
     kpis = compute_kpis(df)
     now_str = datetime.now(IST).strftime("%I:%M:%S %p IST")
 
@@ -433,45 +476,64 @@ def render_ui(
 
     st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
 
-    # Middle Row: Simple Profit Chart (NET PnL Curve)
+    # Middle Row: Cumulative Equity Curve from Inception Capital (₹100,000) to Current Date
     st.markdown(
-        "<h3 style='color: #1e293b; font-weight: 700; margin-bottom: 8px;'>📈 Cumulative Performance (Net PnL)</h3>",
+        "<h3 style='color: #1e293b; font-weight: 700; margin-bottom: 8px;'>📈 Cumulative Equity Curve (Inception ₹100,000 to Current Date)</h3>",
         unsafe_allow_html=True,
     )
 
+    filter_desc = "All Time History" if selected_filter == "All Time" else (f"Today ({today_str})" if selected_filter == "Today" else f"Date {target_date_param}")
     if df.empty:
-        st.info("ℹ️ No trades executed yet today. Market session is being monitored.")
+        st.info(f"ℹ️ No trades recorded for {filter_desc}. Capital is 100% preserved at ₹{kpis['starting_capital']:,.2f}.")
     else:
-        # Build chronological cumsum of Net PnL
+        # Build chronological cumsum of Net PnL and Portfolio Equity
+        starting_cap = kpis["starting_capital"]
         df_sorted = df.sort_values(by="entry_time", ascending=True).copy()
         pnl_col = "net_pnl" if "net_pnl" in df_sorted.columns else "realized_pnl"
         df_sorted["cum_net_pnl"] = df_sorted[pnl_col].cumsum()
+        df_sorted["portfolio_equity"] = starting_cap + df_sorted["cum_net_pnl"]
 
-        # Add initial zero point
-        chart_records = [{"Trade #": "Open", "Net Cumulative PnL (₹)": 0.0}]
+        # Add initial inception baseline point
+        chart_records = [{
+            "Trade Sequence": "Inception (₹1,00,000)",
+            "Portfolio Equity (₹)": float(starting_cap),
+            "Net Cumulative PnL (₹)": 0.0,
+        }]
         for idx, row in enumerate(df_sorted.itertuples(), start=1):
-            t_label = f"#{idx} ({getattr(row, 'time_display', '')})"
+            d_str = getattr(row, "date", "")
+            t_str = getattr(row, "time_display", "")
+            t_label = f"#{idx} ({d_str} {t_str})" if d_str else f"#{idx} ({t_str})"
             chart_records.append({
-                "Trade #": t_label,
+                "Trade Sequence": t_label,
+                "Portfolio Equity (₹)": float(getattr(row, "portfolio_equity", starting_cap)),
                 "Net Cumulative PnL (₹)": float(getattr(row, "cum_net_pnl", 0.0)),
             })
 
         chart_df = pd.DataFrame(chart_records)
-        line_color = "#16a34a" if net_pnl >= 0 else "#dc2626"
+        end_equity = float(chart_df.iloc[-1]["Portfolio Equity (₹)"])
+        line_color = "#16a34a" if end_equity >= starting_cap else "#dc2626"
 
         chart = (
             alt.Chart(chart_df)
             .mark_line(
                 color=line_color,
                 strokeWidth=3,
-                point=alt.OverlayMarkDef(color=line_color, size=60, filled=True),
+                point=alt.OverlayMarkDef(color=line_color, size=65, filled=True),
             )
             .encode(
-                x=alt.X("Trade #:N", title="Trade Sequence", sort=None),
-                y=alt.Y("Net Cumulative PnL (₹):Q", title="Net Cumulative PnL (₹)"),
-                tooltip=["Trade #:N", "Net Cumulative PnL (₹):Q"],
+                x=alt.X("Trade Sequence:N", title="Execution Sequence (Inception to Present)", sort=None),
+                y=alt.Y(
+                    "Portfolio Equity (₹):Q",
+                    title="Portfolio Equity (₹)",
+                    scale=alt.Scale(zero=False, padding=25),
+                ),
+                tooltip=[
+                    alt.Tooltip("Trade Sequence:N", title="Sequence"),
+                    alt.Tooltip("Portfolio Equity (₹):Q", format=",.2f", title="Portfolio Equity"),
+                    alt.Tooltip("Net Cumulative PnL (₹):Q", format=",.2f", title="Net Cumulative PnL"),
+                ],
             )
-            .properties(height=260)
+            .properties(height=280)
             .configure_axis(grid=True, gridColor="#f1f5f9")
             .configure_view(strokeWidth=0)
         )
@@ -479,41 +541,41 @@ def render_ui(
 
     st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
 
-    # Bottom Row: Friendly Trade Log Table displaying Gross ₹, Charges ₹, Net ₹
+    # Bottom Row: Friendly Trade Log Table displaying Date, Time, Gross ₹, Charges ₹, Net ₹
     st.markdown(
-        "<h3 style='color: #1e293b; font-weight: 700; margin-bottom: 8px;'>📋 Live Trade Log</h3>",
+        "<h3 style='color: #1e293b; font-weight: 700; margin-bottom: 8px;'>📋 Live Trade Log (Lifetime Inception History)</h3>",
         unsafe_allow_html=True,
     )
 
     if df.empty:
-        st.info("ℹ️ No trades executed yet today. Market session is being monitored.")
+        st.info(f"ℹ️ No trades recorded for {filter_desc}.")
     else:
-        # Prepare display DataFrame with friendly columns
+        # Prepare display DataFrame with friendly columns in reverse chronological order
+        df_rev = df.sort_values(by="entry_time", ascending=False).copy()
         table_df = pd.DataFrame()
-        table_df["Time"] = df["time_display"]
-        table_df["Strategy"] = df["strategy_display"]
-        table_df["Strikes"] = df["strikes"]
-        table_df["Entry ₹"] = df["actual_entry_price"].apply(lambda v: f"₹{float(v):.2f}")
-        table_df["Exit ₹"] = df["actual_exit_price"].apply(
+        table_df["Date"] = df_rev["date"] if "date" in df_rev.columns else "-"
+        table_df["Time"] = df_rev["time_display"]
+        table_df["Strategy"] = df_rev["strategy_display"]
+        table_df["Strikes"] = df_rev["strikes"]
+        table_df["Entry ₹"] = df_rev["actual_entry_price"].apply(lambda v: f"₹{float(v):.2f}")
+        table_df["Exit ₹"] = df_rev["actual_exit_price"].apply(
             lambda v: f"₹{float(v):.2f}" if pd.notnull(v) and float(v) > 0 else "-"
         )
-        table_df["Gross ₹"] = df["gross_pnl"].apply(
+        table_df["Gross ₹"] = df_rev["gross_pnl"].apply(
             lambda v: f"+₹{float(v):,.2f}" if float(v) > 0 else (f"-₹{abs(float(v)):,.2f}" if float(v) < 0 else "₹0.00")
         )
-        table_df["Charges ₹"] = df["total_charges"].apply(lambda v: f"₹{float(v):,.2f}")
-        table_df["Net ₹"] = df["net_pnl"].apply(
+        table_df["Charges ₹"] = df_rev["total_charges"].apply(lambda v: f"₹{float(v):,.2f}")
+        table_df["Net ₹"] = df_rev["net_pnl"].apply(
             lambda v: f"+₹{float(v):,.2f}" if float(v) > 0 else (f"-₹{abs(float(v)):,.2f}" if float(v) < 0 else "₹0.00")
         )
-        table_df["Status"] = df["status"]
+        table_df["Status"] = df_rev["status"]
 
         # Color-coded styled table based on Net PnL
         def highlight_pnl(row: pd.Series) -> list[str]:
             pnl_str = str(row["Net ₹"])
             if pnl_str.startswith("+"):
-                # Soft green highlight
                 return ["background-color: rgba(34, 197, 94, 0.12)"] * len(row)
             elif pnl_str.startswith("-"):
-                # Soft red highlight
                 return ["background-color: rgba(239, 68, 68, 0.12)"] * len(row)
             return [""] * len(row)
 

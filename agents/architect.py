@@ -12,7 +12,7 @@ Responsibilities:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, time
+from datetime import datetime, time as dtime
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
@@ -26,6 +26,7 @@ from execution_engine import (
 )
 
 IST = ZoneInfo("Asia/Kolkata")
+time = dtime
 EXPIRY_ENTRY_CUTOFF_TIME: time = time(12, 30)  # 12:30 PM IST: Freeze fresh trade entries on expiry days to eliminate 0DTE gamma spikes
 EXPIRY_CUTOFF_TIME: time = time(13, 30)        # 01:30 PM IST: Mandatory gamma cut-off & square-off on expiry days
 EXPIRY_SQUARE_OFF_TIME: time = time(13, 30)    # 01:30 PM IST: Position square-off limit

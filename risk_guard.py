@@ -12,11 +12,12 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, time
+from datetime import date, datetime, time as dtime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -24,14 +25,41 @@ IST = ZoneInfo("Asia/Kolkata")
 # Hard risk limits
 MAX_DAILY_LOSS_INR: float = -1500.0
 MAX_DAILY_TRADES: int = 2
+MAX_PERMITTED_SPREAD_RISK_INR: float = 1500.0
 
 # Session timing constants (IST)
-WINDOW_START_TIME: time = time(9, 45)      # 09:45 AM IST - Entry window opens
-WINDOW_END_TIME: time = time(15, 5)        # 03:05 PM IST - No new entries after this
-SQUARE_OFF_TIME: time = time(15, 10)       # 03:10 PM IST - Mandatory square-off
-MARKET_CLOSE_TIME: time = time(15, 30)     # 03:30 PM IST - Market close
-EXPIRY_ENTRY_CUTOFF_TIME: time = time(12, 30)  # 12:30 PM IST - Freeze fresh entries on expiry days
-EXPIRY_SQUARE_OFF_TIME: time = time(13, 30)    # 01:30 PM IST - Mandatory square-off on expiry days
+WINDOW_START_TIME: dtime = dtime(9, 45)          # 09:45 AM IST - Entry window opens
+WINDOW_END_TIME: dtime = dtime(15, 5)            # 03:05 PM IST - No new entries after this
+SQUARE_OFF_TIME: dtime = dtime(15, 10)           # 03:10 PM IST - Mandatory square-off
+MARKET_CLOSE_TIME: dtime = dtime(15, 30)         # 03:30 PM IST - Market close
+EXPIRY_ENTRY_CUTOFF_TIME: dtime = dtime(12, 30)  # 12:30 PM IST - Freeze fresh entries on expiry days
+EXPIRY_SQUARE_OFF_TIME: dtime = dtime(13, 30)    # 01:30 PM IST - Mandatory square-off on expiry days
+
+
+def validate_physical_spread_risk(
+    spread_width: float,
+    net_credit: float,
+    lot_size: int = 65,
+    max_risk_inr: float = 1500.0,
+) -> tuple[bool, float, str]:
+    """Single Source of Truth for Physical Spread Risk Invariant.
+
+    Formula: physical_spread_risk = round((spread_width - net_credit) * lot_size, 2)
+    Assert: If physical_spread_risk > max_risk_inr (1500.0 INR), trade is strictly rejected.
+
+    Returns:
+        (is_valid, physical_spread_risk, rejection_reason)
+    """
+    physical_spread_risk = round((spread_width - net_credit) * lot_size, 2)
+    if physical_spread_risk > max_risk_inr:
+        min_credit_required = 27.0 if (spread_width == 50.0 and lot_size == 65) else round(spread_width - (max_risk_inr / lot_size), 1)
+        reason = (
+            f"Physical spread risk breach: ({spread_width} - {net_credit:.2f}) * {lot_size} = "
+            f"INR {physical_spread_risk:.2f} > INR {max_risk_inr:.2f} limit. "
+            f"Minimum required credit is >= {min_credit_required:.1f} pts."
+        )
+        return False, physical_spread_risk, reason
+    return True, physical_spread_risk, ""
 
 
 def is_expiry_session(

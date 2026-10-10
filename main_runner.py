@@ -43,7 +43,7 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 from bus import EventStatus, SystemBus
 from execution_engine import AngelAuth, Candle, RejectionDetector, SignalType, SpreadType
 from regime_filter import InitialBalance, InitialBalanceTracker, MarketRegime, RegimeFilter
-from risk_guard import RiskGuard, is_expiry_session
+from risk_guard import RiskGuard, is_expiry_session, validate_physical_spread_risk
 from audit_logger import AuditLogger
 from agents.architect import EXPIRY_CUTOFF_TIME, is_expiry_day
 from agents.notifier import TelegramNotifier, notifier_worker
@@ -361,9 +361,7 @@ def auditor_worker(
                 bus.publish(topic="ORDER_BLOCKED", source="Auditor", target="Notifier", payload={"trade_id": trade_id, "reason": f"Stop-loss risk INR {stop_loss_risk_inr} > 1500 INR"})
                 continue
 
-            # Invariant 1b: Physical spread width catastrophic risk ceiling <= 1500 INR
-            # In a 50-point spread with 65 lot size, physical max loss = (width - credit) * 65.
-            # (50 - 13) * 65 = INR 2,405 > 1500 INR. Must require credit >= 27.0 pts or veto outright.
+            # Invariant 1b: Physical spread width catastrophic risk ceiling <= 1500 INR (Single Source of Truth)
             spread_width = float(payload.get("spread_width", 0.0))
             if spread_width <= 0 and "legs" in payload and len(payload["legs"]) >= 2:
                 spread_width = abs(float(payload["legs"][0].get("strike", 0.0)) - float(payload["legs"][1].get("strike", 0.0)))
@@ -372,15 +370,16 @@ def auditor_worker(
 
             net_credit = float(payload.get("net_credit", 0.0))
             qty = LOT_SIZE
-            physical_spread_risk = round((spread_width - net_credit) * qty, 2)
-            if physical_spread_risk > MAX_PERMITTED_SPREAD_RISK_INR:
+            is_valid_spread, physical_spread_risk, risk_reason = validate_physical_spread_risk(
+                spread_width=spread_width,
+                net_credit=net_credit,
+                lot_size=qty,
+                max_risk_inr=MAX_PERMITTED_SPREAD_RISK_INR,
+            )
+            if not is_valid_spread:
                 bus.update_status(ev.id, EventStatus.VETOED)
-                logger.warning(
-                    f"[AUDITOR] Vetoed {trade_id}: Physical spread risk breach: "
-                    f"({spread_width} - {net_credit:.2f}) * {qty} = INR {physical_spread_risk:.2f} > 1500 INR limit. "
-                    f"Minimum required credit is >= 27.0 pts."
-                )
-                bus.publish(topic="ORDER_BLOCKED", source="Auditor", target="Notifier", payload={"trade_id": trade_id, "reason": f"Physical spread risk breach: INR {physical_spread_risk:.2f} > 1500 INR"})
+                logger.warning(f"[AUDITOR] Vetoed {trade_id}: {risk_reason}")
+                bus.publish(topic="ORDER_BLOCKED", source="Auditor", target="Notifier", payload={"trade_id": trade_id, "reason": risk_reason})
                 continue
 
             # Invariant 2: Daily loss limit

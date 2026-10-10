@@ -124,7 +124,7 @@ class SystemVerifier:
             )
         else:
             arch_content = self.architect_path.read_text(encoding="utf-8")
-            has_cutoff = bool(re.search(r'EXPIRY_CUTOFF_TIME\s*(?::\s*time)?\s*=\s*time\(\s*13\s*,\s*30\s*\)', arch_content))
+            has_cutoff = bool(re.search(r'EXPIRY_CUTOFF_TIME\s*(?::\s*(?:time|dtime))?\s*=\s*(?:time|dtime)\(\s*13\s*,\s*30\s*\)', arch_content))
             has_gate = bool(re.search(r'is_expiry_day.*EXPIRY_CUTOFF_TIME', arch_content))
 
             if has_cutoff and has_gate:

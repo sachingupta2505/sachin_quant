@@ -40,10 +40,8 @@ def reconcile_positions(target_date: str = "2026-10-06") -> dict:
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    # Step 0: Clean up test artifacts created during post-market unit test runs (after 15:30)
-    cursor.execute("DELETE FROM execution_events WHERE trade_id LIKE 'SPD-20261006-15%'")
-    cursor.execute("DELETE FROM trade_journal WHERE trade_id LIKE 'SPD-20261006-15%'")
-    conn.commit()
+    # Step 0: Retain full lifetime history (No DELETE statements permitted on production DB)
+    pass
 
     # Step 1: Inspect existing trades in trade_journal
     rows = cursor.execute("SELECT * FROM trade_journal").fetchall()

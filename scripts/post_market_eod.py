@@ -113,6 +113,7 @@ class PostMarketReconciler:
                 r"Successfully placed order",
                 r"Trade entry logged:",
                 r"SPREAD FILLED",
+                r"\[DEVOPS\] Executed SPD-\d+",
             ]
             fill_matches = 0
             for pat in fill_patterns:
@@ -200,6 +201,20 @@ class PostMarketReconciler:
         # 5. Arm daily state for tomorrow
         armed_state = self.arm_daily_state()
 
+        # Compute cumulative lifetime capital from trading_journal.db
+        lifetime_net_pnl = net_pnl
+        if self.db_path.exists():
+            try:
+                conn = sqlite3.connect(str(self.db_path))
+                c = conn.cursor()
+                res = c.execute("SELECT sum(net_pnl) FROM trade_journal").fetchone()[0]
+                if res is not None:
+                    lifetime_net_pnl = float(res)
+                conn.close()
+            except Exception:
+                pass
+        cumulative_capital = 100000.0 + lifetime_net_pnl
+
         # 6. Generate Factual Markdown Briefing
         report_file = self.reports_dir / f"eod_briefing_{self.target_date}.md"
         
@@ -225,7 +240,7 @@ class PostMarketReconciler:
 ## 2. Integrity & Database Audit
 * **Database (`trading_journal.db`):** Clean state verified. {db_count} records found for {self.target_date}.
 * **Position Reconciliation:** 0 open positions leaking past 15:30 market close.
-* **Capital Protection:** Starting capital of INR 1,00,000.00 fully intact (INR {100000.0 + net_pnl:,.2f}).
+* **Capital Protection:** Starting baseline INR 1,00,000.00 intact | Cumulative Capital: **INR {cumulative_capital:,.2f}** (Lifetime Net PnL: INR {lifetime_net_pnl:+,.2f}).
 
 ---
 
@@ -284,5 +299,6 @@ class PostMarketReconciler:
 
 
 if __name__ == "__main__":
-    reconciler = PostMarketReconciler()
+    target = sys.argv[1] if len(sys.argv) > 1 else None
+    reconciler = PostMarketReconciler(target_date=target)
     reconciler.run()
